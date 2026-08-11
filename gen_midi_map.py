@@ -5,13 +5,14 @@ params.py is the one description of the DCO's control surface, so the firmware t
 the implementation chart and the panel session are all generated from it and cannot
 drift apart. Three outputs:
 
-  ../../midi_cc_map.h              the MidiCcEntry table, included by DCO/midi_cc.h
-  ../../docs/MIDI_CC_MAP.md        the implementation chart
-  ../panels/<model>_panel.json     the Open Stage Control session
+  ../DCO/midi_cc_map.h              the MidiCcEntry table, included by DCO/midi_cc.h
+  ../DCO/docs/MIDI_CC_MAP.md        the implementation chart
+  ../DCO/tools/panels/<model>_panel.json  the Open Stage Control session
 
-The synth model (models.py) is read from the firmware this tool copy sits in —
-the USBDevice.setProductDescriptor() string in ../../Serial.ino — so each
-project's copy targets its own board; --model overrides.
+The synth model (models.py) is read from the firmware sitting next to this
+tool at the project root — the USBDevice.setProductDescriptor() string in
+../DCO/Serial.ino — so it targets whichever project checked this repo out;
+--model overrides.
 
 Usage:
   python3 gen_midi_map.py           write the three files
@@ -80,7 +81,7 @@ CURVE_LINEAR = "MIDI_CC_LINEAR"
 CURVE_EXP_TIME = "MIDI_CC_EXP_TIME"
 
 HERE = Path(__file__).resolve().parent
-DCO_DIR = HERE.parents[1]
+DCO_DIR = HERE.parent / "DCO"
 
 MAP_HEADER = DCO_DIR / "midi_cc_map.h"
 CHART = DCO_DIR / "docs" / "MIDI_CC_MAP.md"
@@ -91,7 +92,7 @@ def panel_path() -> Path:
 
 
 def detect_firmware_model() -> str | None:
-    """Read the USB product descriptor from ../../Serial.ino and match a profile."""
+    """Read the USB product descriptor from ../DCO/Serial.ino and match a profile."""
     try:
         source = (DCO_DIR / "Serial.ino").read_text()
     except OSError:
@@ -105,7 +106,7 @@ def detect_firmware_model() -> str | None:
             return profile.key
     return None
 
-GENERATED_BY = "tools/dco_control/gen_midi_map.py from tools/dco_control/params.py"
+GENERATED_BY = "DCO-CONTROL-PANEL/gen_midi_map.py from DCO-CONTROL-PANEL/params.py"
 
 
 @dataclass
@@ -314,7 +315,7 @@ def emit_chart(entries: list[Entry]) -> str:
     out: list[str] = [
         "# MIDI CC implementation chart",
         "",
-        "Generated from `tools/dco_control/params.py` by `tools/dco_control/gen_midi_map.py`. "
+        "Generated from `DCO-CONTROL-PANEL/params.py` by `DCO-CONTROL-PANEL/gen_midi_map.py`. "
         "Do not edit by hand.",
         "",
         "Every control the bench app exposes is reachable from a 7-bit CC on any channel "
@@ -384,7 +385,7 @@ def emit_chart(entries: list[Entry]) -> str:
         "",
         "Autotune takes the board over for about a minute and the store writes the "
         "filesystem, so neither should be one stray controller away. Both are still "
-        "available from the serial bench app in `tools/dco_control`.",
+        "available from the serial bench app in `DCO-CONTROL-PANEL`.",
         "",
         "Reserved controllers left untouched: "
         + ", ".join(str(c) for c in sorted(RESERVED_CC))
@@ -569,7 +570,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--check", action="store_true",
                         help="validate and report drift without writing anything")
     parser.add_argument("--model", choices=sorted(models.PROFILES),
-                        help="synth model (default: read from ../../Serial.ino)")
+                        help="synth model (default: read from ../DCO/Serial.ino)")
     args = parser.parse_args(argv)
 
     global MIDI_TARGET

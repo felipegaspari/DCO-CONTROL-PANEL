@@ -11,9 +11,9 @@ from a MIDI keyboard, VMPK, or anything else that can reach an ALSA MIDI port.
 
 ## 0. Synth models
 
-One codebase drives both synths; the copies in `DCO3-MONOSYNTH/DCO/tools/dco_control`
-and `DCO4-REBORN/DCO/tools/dco_control` are identical. Everything model-specific lives
-in [`models.py`](models.py):
+One codebase drives both synths, shared via the `DCO-CONTROL-PANEL` submodule
+checked out at the root of both `DCO3-MONOSYNTH` and `DCO4-REBORN`, next to
+each project's `DCO/`. Everything model-specific lives in [`models.py`](models.py):
 
 | | dco3 | dco4 |
 |---|---|---|
@@ -48,12 +48,12 @@ Serial2, dump returns as `'t'` chunks into the Board output pane; needs Mainboar
 ## 1. Firmware requirement
 
 The board must be built with `ENABLE_USB_CONTROL`, which is on by default in
-[`DCO.ino`](../../DCO.ino). USB CDC uses the same slim inner frames and handler LUT as
+[`DCO.ino`](../DCO/DCO.ino). USB CDC uses the same slim inner frames and handler LUT as
 Serial2 (`serial_input_protocol.h`). The Input board firmware still sends the older BE
 format until it is updated; this tool is the live control path.
 
 On-wire framing defaults to **RAW** (inner bytes as-is). To A/B **COBS** (`COBS(inner)+0x00`),
-uncomment `#define SERIAL_FRAMING_COBS` in [`DCO.ino`](../../DCO.ino) and start this tool
+uncomment `#define SERIAL_FRAMING_COBS` in [`DCO.ino`](../DCO/DCO.ino) and start this tool
 with `--cobs` or `DCO_SERIAL_COBS=1`. Mismatch (firmware RAW + tool `--cobs`, or the reverse)
 looks like ignored controls; the tool logs `[link] framing=...` on connect.
 
@@ -68,8 +68,8 @@ arduino-cli compile \
 
 `usbstack=tinyusb` is required (USB MIDI + CDC). `flash=…_524288` allocates a 512 KB
 LittleFS partition for MCU presets and calibration files — without it, board-side save /
-dump fails at runtime. See [`docs/PRESET_STORE.md`](../../docs/PRESET_STORE.md) and
-[`docs/BUILD_FLAGS.md`](../../docs/BUILD_FLAGS.md).
+dump fails at runtime. See [`docs/PRESET_STORE.md`](../DCO/docs/PRESET_STORE.md) and
+[`docs/BUILD_FLAGS.md`](../DCO/docs/BUILD_FLAGS.md).
 
 Without `usbstack=tinyusb` the build fails with
 `#error TinyUSB is not selected, please select it in "Tools->Menu->USB Stack"`.
@@ -147,7 +147,7 @@ are not stored and are not part of Connect / preset / **Send all** — only the 
 | **Push / Pull all** | Walk occupied slots either way |
 | **Save board live state → slot** | `'q'` name + `PARAM_PRESET_SAVE` (board snapshots *its* live state) |
 
-Firmware details and text protocol: [`docs/PRESET_STORE.md`](../../docs/PRESET_STORE.md).
+Firmware details and text protocol: [`docs/PRESET_STORE.md`](../DCO/docs/PRESET_STORE.md).
 
 ### Patch / bank / cal files
 
@@ -184,7 +184,7 @@ bench-only buttons:
 | PWM | Pulse width, LFO2 and envelope to PW |
 | LFOs | Waveforms, speeds, and the LFO routing depths |
 | Calibration | Autotune, manual cal, PIO pulse (debug 160), fake-cal seed, **Calibration backup** (dump/load LittleFS tables ↔ `dco3-cal` file) |
-| Character | Master Character amount (ParamId 221) plus diagnostic noise jitters via debug 160 (`0xC8` / `0xCA` / `0xCB`); see [`docs/CHARACTER.md`](../../docs/CHARACTER.md) |
+| Character | Master Character amount (ParamId 221) plus diagnostic noise jitters via debug 160 (`0xC8` / `0xCA` / `0xCB`); see [`docs/CHARACTER.md`](../DCO/docs/CHARACTER.md) |
 | Diagnostics | PIO topology / period probes and hot-path profiler buttons |
 
 **Calibration backup** (connected board): **Dump board → file…** pulls all five tables
@@ -229,7 +229,7 @@ style so the same code works under either backend.
 The **Oscillators** tab (Sync section) is the reason this tool exists. `PARAM_SOFT_SYNC` (36)
 (0 = hard, 1..3 = soft-sync thresholds) and `PARAM_SUBOSC_DIVIDE` (37) have no Input-board UI
 at all, so the panel cannot reach them; this is the only way to exercise them. See
-[`DCO/docs/PIO_OSCILLATORS.md`](../../docs/PIO_OSCILLATORS.md) for what they do.
+[`DCO/docs/PIO_OSCILLATORS.md`](../DCO/docs/PIO_OSCILLATORS.md) for what they do.
 
 On the **Diagnostics** tab, the three PIO buttons call the bench helpers documented in
 section 12 of that file, which nothing else in the firmware invokes:
@@ -247,11 +247,11 @@ section 12 of that file, which nothing else in the firmware invokes:
   remaining stack on both cores. Needs `ENABLE_MEM_DIAG` (default on). **Mem diag polls
   off/on** (14/15) stop the per-loop poll so period-only profiler dumps match older
   benches without a rebuild; dump 13 is ignored while off. Comment out `ENABLE_MEM_DIAG`
-  for a hard zero-cost match. See [`DCO/docs/MEMORY.md`](../../docs/MEMORY.md).
+  for a hard zero-cost match. See [`DCO/docs/MEMORY.md`](../DCO/docs/MEMORY.md).
 
 On the same tab, the **Hot-path profiler** buttons drive `PARAM_DEBUG_COMMAND` values
 10 / 11 / 12. They only do anything when the firmware is built with `RUNNING_AVERAGE`; see
-[`DCO/docs/BENCHMARKING.md`](../../docs/BENCHMARKING.md).
+[`DCO/docs/BENCHMARKING.md`](../DCO/docs/BENCHMARKING.md).
 
 - **Dump profiler once** asks both cores for a snapshot; core 0 prints the budget table
   into the Board output pane a moment later.
@@ -270,7 +270,7 @@ parameters doing different jobs:
   degree entries do the same restart and delay OSC2's first flyback (one-shot X countdown to
   `loop_final`; later cycles keep a normal pulse). Needs EXACT_Y retrig (default). Note that
   free running also skips the exact-period rewrite, so it tunes very slightly differently —
-  see section 8 of [`PIO_OSCILLATORS.md`](../../docs/PIO_OSCILLATORS.md).
+  see section 8 of [`PIO_OSCILLATORS.md`](../DCO/docs/PIO_OSCILLATORS.md).
 
 For the hard-sync listening check: set **Hard sync topology** to 1 or 2, leave **Soft sync**
 off, hold a note, and sweep the slave's detune. A timbral formant sweep means sync is working.
@@ -286,7 +286,7 @@ becomes identical every time, where at **Off** it varies from note to note.
 This tool talks to the board over USB serial, which needs `ENABLE_USB_CONTROL` and a cable
 to this machine. For everything else — a DAW, a tablet, a hardware controller — the same
 control surface is also mapped onto 7-bit MIDI CC, listed in
-[`DCO/docs/MIDI_CC_MAP.md`](../../docs/MIDI_CC_MAP.md).
+[`DCO/docs/MIDI_CC_MAP.md`](../DCO/docs/MIDI_CC_MAP.md).
 
 `gen_midi_map.py` generates that chart, the firmware's `midi_cc_map.h` and a ready-made
 [Open Stage Control](https://openstagecontrol.ammd.net/) session from the same `params.py`
@@ -337,8 +337,8 @@ a minute-long takeover of the board and the other writes the filesystem. Those s
 
 ### Adding a parameter
 
-Add the ID to [`DCO/params_def.h`](../../params_def.h) and an `apply_param_*` entry to
-`paramTable[]` in [`DCO/params.ino`](../../params.ino) as usual, then add one `Param`
+Add the ID to [`DCO/params_def.h`](../DCO/params_def.h) and an `apply_param_*` entry to
+`paramTable[]` in [`DCO/params.ino`](../DCO/params.ino) as usual, then add one `Param`
 row to `params.py`. The UI picks it up with no changes to `app.py`. To give it a CC as
 well, put a free controller number in the row's `cc=` field and re-run `gen_midi_map.py`;
 it refuses to run on a collision or a reserved controller. Persistable patch params also
@@ -347,10 +347,10 @@ MCU presets.
 
 ## 8. Protocol notes
 
-Frames match [`DCO/serial_input_protocol.h`](../../serial_input_protocol.h) /
-[`DCO/serial_frame.h`](../../serial_frame.h): one command byte, then a fixed little-endian
+Frames match [`DCO/serial_input_protocol.h`](../DCO/serial_input_protocol.h) /
+[`DCO/serial_frame.h`](../DCO/serial_frame.h): one command byte, then a fixed little-endian
 payload (RAW on the wire today; COBS can wrap the same inner frames later). There is no
-finish byte. Full preset/cal dump protocol: [`docs/PRESET_STORE.md`](../../docs/PRESET_STORE.md).
+finish byte. Full preset/cal dump protocol: [`docs/PRESET_STORE.md`](../DCO/docs/PRESET_STORE.md).
 
 - **`'p'`** — `[id:u8][value:i16 LE]` (4 bytes total). Includes PW 210, EnvVCA→VCA 222, and
   preset/cal commands 170–173.
@@ -362,7 +362,7 @@ finish byte. Full preset/cal dump protocol: [`docs/PRESET_STORE.md`](../../docs/
   request), `'L'` (1-byte `[slot:u8]` load notice). Not used by `dco_control` itself
   (USB host uses `'p'` PARAM_PRESET_DUMP / `[pdir]` text instead); documented here
   because the wire and ParamId numbering are shared. See
-  [`docs/PRESET_STORE.md`](../../docs/PRESET_STORE.md).
+  [`docs/PRESET_STORE.md`](../DCO/docs/PRESET_STORE.md).
 - **Envelope attack, decay and release are exp-mapped on the wire** (0..25000), while
   sustain is linear (0..4095). `protocol.lin_to_exp()` replicates
   `linearToExponential(v, 50, 25000)` from the Input board so a slider here feels like the
