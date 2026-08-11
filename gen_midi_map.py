@@ -11,8 +11,8 @@ drift apart. Three outputs:
 
 The synth model (models.py) is read from the firmware sitting next to this
 tool at the project root — the USBDevice.setProductDescriptor() string in
-../DCO/Serial.ino — so it targets whichever project checked this repo out;
---model overrides.
+../DCO/Serial.ino, or ../project_config.h — so it targets whichever project
+checked this repo out; --model overrides.
 
 Usage:
   python3 gen_midi_map.py           write the three files
@@ -101,19 +101,23 @@ def panel_path() -> Path:
 
 
 def detect_firmware_model() -> str | None:
-    """Read the USB product descriptor from ../DCO/Serial.ino and match a profile."""
+    """Read the USB product descriptor from ../DCO/Serial.ino and match a profile.
+
+    Falls back to the superproject's project_config.h, which is what the boards
+    themselves read, so a DCO whose descriptor has been renamed still generates
+    the right map instead of silently generating the other synth's.
+    """
     try:
         source = (DCO_DIR / "Serial.ino").read_text()
     except OSError:
-        return None
+        source = ""
     m = re.search(r'setProductDescriptor\("([^"]+)"\)', source)
-    if not m:
-        return None
-    product = m.group(1).strip().lower()
-    for profile in models.PROFILES.values():
-        if product.startswith(profile.usb_product_prefix.lower()):
-            return profile.key
-    return None
+    if m:
+        product = m.group(1).strip().lower()
+        for profile in models.PROFILES.values():
+            if product.startswith(profile.usb_product_prefix.lower()):
+                return profile.key
+    return models.detect_from_project()
 
 GENERATED_BY = "DCO-CONTROL-PANEL/gen_midi_map.py from DCO-CONTROL-PANEL/params.py"
 

@@ -9,9 +9,10 @@ string used for auto-detection.
 
 Everything model-specific lives in a ModelProfile here. The active profile is
 chosen at startup — --model dco3|dco4, or auto-detected from the USB product
-descriptors of the connected serial ports — and the rest of the tool reads it
-via models.active(). params.apply_model() bakes the profile's param overrides
-into params.PARAMS before the GUI is built.
+descriptors of the connected serial ports, or from the PROJECT_INSTRUMENT in
+the superproject's project_config.h when no board is plugged in — and the rest
+of the tool reads it via models.active(). params.apply_model() bakes the
+profile's param overrides into params.PARAMS before the GUI is built.
 """
 
 from __future__ import annotations
@@ -140,11 +141,16 @@ def set_active(key: str) -> ModelProfile:
 
 
 def detect() -> str | None:
-    """Guess the model from the USB product strings of the visible serial ports.
+    """Guess the model from the connected board, or from the project this copy sits in.
 
-    Returns a profile key, or None when no known board is enumerated (both
-    boards present also returns the first match — use --model to be explicit).
+    Returns a profile key, or None when neither is available (both boards
+    present also returns the first match — use --model to be explicit).
     """
+    return detect_from_usb() or detect_from_project()
+
+
+def detect_from_usb() -> str | None:
+    """Match the USB product strings of the visible serial ports against the profiles."""
     try:
         from serial.tools import list_ports
     except ImportError:
@@ -155,6 +161,28 @@ def detect() -> str | None:
             if profile.usb_product_prefix.lower() in product:
                 return profile.key
     return None
+
+
+def detect_from_project() -> str | None:
+    """Read PROJECT_INSTRUMENT from the superproject's project_config.h.
+
+    This repo is checked out into both DCO3-MONOSYNTH and DCO4-REBORN, and that
+    header is how every board in a project knows which instrument it belongs to.
+    Reading it here means the tool opens as the right synth with nothing plugged
+    in, instead of falling back to the dco3 profile inside a dco4 tree.
+    """
+    import re
+    from pathlib import Path
+
+    header = Path(__file__).resolve().parent.parent / "project_config.h"
+    try:
+        text = header.read_text()
+    except OSError:
+        return None
+    m = re.search(r"^\s*#\s*define\s+PROJECT_INSTRUMENT\s+(\d+)", text, re.M)
+    if not m:
+        return None
+    return {"3": "dco3", "4": "dco4"}.get(m.group(1))
 
 
 def filter_debug_commands(commands: tuple[tuple[str, int], ...]) -> tuple[tuple[str, int], ...]:
