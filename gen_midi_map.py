@@ -22,6 +22,12 @@ The checks are the interesting part: they catch a CC collision, a reserved contr
 a parameter that params.py claims but the firmware does not route, a block value whose
 CC_LOCAL_* target is not handled in midi.ino, and a combo entry that 7-bit CC cannot
 express exactly.
+
+--check also holds protocol.py against the firmware headers it transcribes by hand.
+ParamIds come from ../DCO-PROTOCOL/params_def.h and command bytes and payload lengths
+from ../DCO-PROTOCOL/serial_input_protocol.h — the shared library every board compiles,
+so this validates the host tool against all of them at once. Without that, a renumbered
+id or a resized payload only shows up as frames the board silently drops.
 """
 
 from __future__ import annotations
@@ -82,6 +88,9 @@ CURVE_EXP_TIME = "MIDI_CC_EXP_TIME"
 
 HERE = Path(__file__).resolve().parent
 DCO_DIR = HERE.parent / "DCO"
+# The protocol headers every board compiles, shared through the DCO-PROTOCOL
+# library checked out beside this tool.
+PROTOCOL_DIR = HERE.parent / "DCO-PROTOCOL"
 
 MAP_HEADER = DCO_DIR / "midi_cc_map.h"
 CHART = DCO_DIR / "docs" / "MIDI_CC_MAP.md"
@@ -211,7 +220,7 @@ def build_entries(enum_by_id: dict[int, str]) -> list[Entry]:
 
 def read_param_ids() -> tuple[dict[int, str], set[str]]:
     """(id -> PARAM_* name) from params_def.h, and the names routed by paramTable[]."""
-    header = (DCO_DIR / "params_def.h").read_text()
+    header = (PROTOCOL_DIR / "params_def.h").read_text()
     enum_by_id: dict[int, str] = {}
     for name, value in re.findall(r"^\s*(PARAM_\w+)\s*=\s*(\d+)", header, re.M):
         enum_by_id[int(value)] = name
@@ -228,6 +237,73 @@ def read_local_targets() -> tuple[set[str], set[str]]:
     declared.discard("CC_LOCAL_FIRST")
     handled = set(re.findall(r"case\s+(CC_LOCAL_\w+)\s*:", (DCO_DIR / "midi.ino").read_text()))
     return declared, handled
+
+
+def read_protocol_header() -> tuple[dict[str, int], dict[str, int]]:
+    """(INPUT_CMD_* -> byte, INPUT_SERIAL_LEN_* -> payload length) from the shared header."""
+    text = (PROTOCOL_DIR / "serial_input_protocol.h").read_text()
+    commands = {name: ord(char)
+                for name, char in re.findall(r"(INPUT_CMD_\w+)\s*=\s*'(.)'", text)}
+    lengths = {name: int(value)
+               for name, value in re.findall(r"(INPUT_SERIAL_LEN_\w+)\s*=\s*(\d+)", text)}
+    return commands, lengths
+
+
+def sample_frames() -> dict[str, bytes]:
+    """One frame from each protocol.py builder, keyed by the length constant it must match."""
+    return {
+        "INPUT_SERIAL_LEN_ADSR_BLOCK": protocol.adsr_block(protocol.CMD_ADSR1_BLOCK, 0, 0, 0, 0),
+        "INPUT_SERIAL_LEN_FILTER_BLOCK": protocol.filter_block(0, 0, 0, 0),
+        "INPUT_SERIAL_LEN_PARAM_16": protocol.param16(0, 0),
+        "INPUT_SERIAL_LEN_PRESET_NAME": protocol.preset_name(""),
+        "INPUT_SERIAL_LEN_BULK_CHUNK": protocol.bulk_chunk(0, 0, 0, b""),
+        "INPUT_SERIAL_LEN_BULK_COMMIT": protocol.bulk_commit(0, 0, 0, 0),
+    }
+
+
+def validate_protocol(enum_by_id: dict[int, str]) -> list[str]:
+    """Check protocol.py against the firmware headers it transcribes.
+
+    The command bytes and payload layouts here are a hand copy of
+    serial_input_protocol.h, so they are the one part of the tool that can drift
+    without anything failing until a frame reaches a board and is silently dropped.
+    """
+    problems: list[str] = []
+    commands, lengths = read_protocol_header()
+
+    for name in sorted(n for n in dir(protocol) if n.startswith("CMD_")):
+        value = getattr(protocol, name)
+        if not isinstance(value, bytes):
+            continue
+        header_name = "INPUT_" + name
+        if header_name not in commands:
+            problems.append(f"protocol.{name} has no {header_name} in serial_input_protocol.h")
+        elif commands[header_name] != value[0]:
+            problems.append(
+                f"protocol.{name} is {value!r} but {header_name} is "
+                f"'{chr(commands[header_name])}'"
+            )
+
+    for length_name, frame in sample_frames().items():
+        expected = lengths.get(length_name)
+        if expected is None:
+            problems.append(f"{length_name} is missing from serial_input_protocol.h")
+        elif len(frame) - 1 != expected:
+            problems.append(
+                f"protocol.py builds a {len(frame) - 1}-byte payload for "
+                f"{chr(frame[0])!r} but {length_name} is {expected}"
+            )
+
+    for name in ("PARAM_PRESET_SAVE", "PARAM_PRESET_LOAD",
+                 "PARAM_PRESET_DUMP", "PARAM_CAL_DUMP"):
+        pid = getattr(protocol, name)
+        if enum_by_id.get(pid) != name:
+            problems.append(
+                f"protocol.{name} is {pid}, which is "
+                f"{enum_by_id.get(pid) or 'unused'} in params_def.h"
+            )
+
+    return problems
 
 
 def validate(entries: list[Entry], enum_by_id: dict[int, str], routed: set[str]) -> list[str]:
@@ -266,6 +342,8 @@ def validate(entries: list[Entry], enum_by_id: dict[int, str], routed: set[str])
             problems.append(f"{e.target} has no case in midi_cc_apply() ({e.label})")
     for name in sorted(declared - {e.target for e in entries if e.is_local}):
         problems.append(f"{name} is declared in midi_cc.h but no CC maps to it")
+
+    problems.extend(validate_protocol(enum_by_id))
 
     return problems
 

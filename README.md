@@ -337,7 +337,7 @@ a minute-long takeover of the board and the other writes the filesystem. Those s
 
 ### Adding a parameter
 
-Add the ID to [`DCO/params_def.h`](../DCO/params_def.h) and an `apply_param_*` entry to
+Add the ID to the shared [`DCO-PROTOCOL/params_def.h`](../DCO-PROTOCOL/params_def.h) and an `apply_param_*` entry to
 `paramTable[]` in [`DCO/params.ino`](../DCO/params.ino) as usual, then add one `Param`
 row to `params.py`. The UI picks it up with no changes to `app.py`. To give it a CC as
 well, put a free controller number in the row's `cc=` field and re-run `gen_midi_map.py`;
@@ -347,10 +347,14 @@ MCU presets.
 
 ## 8. Protocol notes
 
-Frames match [`DCO/serial_input_protocol.h`](../DCO/serial_input_protocol.h) /
-[`DCO/serial_frame.h`](../DCO/serial_frame.h): one command byte, then a fixed little-endian
-payload (RAW on the wire today; COBS can wrap the same inner frames later). There is no
-finish byte. Full preset/cal dump protocol: [`docs/PRESET_STORE.md`](../DCO/docs/PRESET_STORE.md).
+Frames match the shared library every board compiles,
+[`DCO-PROTOCOL/serial_input_protocol.h`](../DCO-PROTOCOL/serial_input_protocol.h) /
+[`serial_frame.h`](../DCO-PROTOCOL/serial_frame.h): one command byte, then a fixed
+little-endian payload (RAW on the wire today; COBS can wrap the same inner frames later).
+There is no finish byte. `gen_midi_map.py --check` validates `protocol.py` against those
+headers, so a command byte or payload size that moves in the firmware fails the check
+here. Full spec: [`DCO-PROTOCOL/README.md`](../DCO-PROTOCOL/README.md). Preset/cal dump
+protocol: [`docs/PRESET_STORE.md`](../DCO/docs/PRESET_STORE.md).
 
 - **`'p'`** — `[id:u8][value:i16 LE]` (4 bytes total). Includes PW 210, EnvVCA→VCA 222, and
   preset/cal commands 170–173.
