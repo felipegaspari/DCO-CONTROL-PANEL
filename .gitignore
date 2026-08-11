@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Local per-project preset bank data (runtime state, not source).
+presets/bank.json
+presets/bank_dco3.json
+presets/bank_dco4.json

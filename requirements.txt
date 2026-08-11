@@ -1,0 +1,6 @@
+pyserial>=3.5
+
+# Optional. If present the UI switches to the Sun Valley ttk theme, which looks more
+# modern and gives boolean parameters real toggle switches. Nothing to configure: the
+# app detects it at startup and falls back to a restyled clam theme when it is absent.
+# sv-ttk>=2.6
