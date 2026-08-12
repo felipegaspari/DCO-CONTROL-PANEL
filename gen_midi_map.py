@@ -5,7 +5,7 @@ params.py is the one description of the DCO's control surface, so the firmware t
 the implementation chart and the panel session are all generated from it and cannot
 drift apart. Three outputs:
 
-  ../DCO/midi_cc_map.h              the MidiCcEntry table, included by DCO/midi_cc.h
+  ../DCO/_shared/midi_cc_map.h      the MidiCcEntry table, included by DCO/midi_cc.h
   ../DCO/docs/MIDI_CC_MAP.md        the implementation chart
   ../DCO/tools/panels/<model>_panel.json  the Open Stage Control session
 
@@ -92,7 +92,7 @@ DCO_DIR = HERE.parent / "DCO"
 # library checked out beside this tool.
 PROTOCOL_DIR = HERE.parent / "DCO-PROTOCOL"
 
-MAP_HEADER = DCO_DIR / "midi_cc_map.h"
+MAP_HEADER = DCO_DIR / "_shared" / "midi_cc_map.h"
 CHART = DCO_DIR / "docs" / "MIDI_CC_MAP.md"
 
 
@@ -237,7 +237,7 @@ def read_param_ids() -> tuple[dict[int, str], set[str]]:
 
 def read_local_targets() -> tuple[set[str], set[str]]:
     """CC_LOCAL_* names declared in midi_cc.h, and those handled in midi.ino."""
-    declared = set(re.findall(r"(CC_LOCAL_\w+)", (DCO_DIR / "midi_cc.h").read_text()))
+    declared = set(re.findall(r"(CC_LOCAL_\w+)", (DCO_DIR / "_shared" / "midi_cc.h").read_text()))
     declared.discard("CC_LOCAL_FIRST")
     handled = set(re.findall(r"case\s+(CC_LOCAL_\w+)\s*:", (DCO_DIR / "midi.ino").read_text()))
     return declared, handled
@@ -369,7 +369,7 @@ def emit_map_header(entries: list[Entry]) -> str:
         "// CC_LOCAL_FIRST are block values that midi_cc_apply() writes directly.",
         "",
         '#include <stddef.h>',
-        '#include "params_def.h"',
+        '#include "../params_def.h"',
         '#include "midi_cc.h"',
         "",
         "static const MidiCcEntry midiCcMap[] = {",

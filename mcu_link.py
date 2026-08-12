@@ -37,6 +37,8 @@ def cal_tables() -> dict[str, tuple[int, int, int]]:
         "PWHighLimit": (3, protocol.BULK_TARGET_PW_HIGH_LIMIT, m.pw_bank_size),
         "PWLowLimit": (4, protocol.BULK_TARGET_PW_LOW_LIMIT, m.pw_bank_size),
         "ManualOffset": (5, protocol.BULK_TARGET_MANUAL_OFFSET, m.manual_offset_size),
+        "AmpComp440": (6, protocol.BULK_TARGET_AMP_COMP_440, m.amp_comp_440_size),
+        "AmpCompDutyOffset": (7, protocol.BULK_TARGET_AMP_COMP_DUTY, m.amp_comp_duty_size),
     }
 
 _RE_DUMP_BEGIN = re.compile(r"^\[dump\] begin target=(\S+)(?: slot=(\d+))? size=(\d+)")

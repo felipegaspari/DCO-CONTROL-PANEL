@@ -29,7 +29,7 @@ CMD_BULK_COMMIT = b"C"  # verify + persist staged bytes
 PARAM_PRESET_SAVE = 170  # value = slot: save the board's live state
 PARAM_PRESET_LOAD = 171  # value = slot: recall a slot on the board
 PARAM_PRESET_DUMP = 172  # -1 = directory listing, 0..255 = slot record hex
-PARAM_CAL_DUMP = 173     # 0/-1 = all cal tables, 1..5 = one
+PARAM_CAL_DUMP = 173     # 0/-1 = all cal tables, 1..7 = one
 
 # Bulk restore targets ('B'/'C' first payload byte, DCO/preset_store.h).
 BULK_TARGET_PRESET = 0
@@ -38,6 +38,8 @@ BULK_TARGET_PW_CENTER = 2
 BULK_TARGET_PW_HIGH_LIMIT = 3
 BULK_TARGET_PW_LOW_LIMIT = 4
 BULK_TARGET_MANUAL_OFFSET = 5
+BULK_TARGET_AMP_COMP_440 = 6
+BULK_TARGET_AMP_COMP_DUTY = 7
 
 BULK_CHUNK_DATA = 32
 

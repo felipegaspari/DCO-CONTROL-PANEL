@@ -190,6 +190,8 @@ def load_bank_file(path: str | Path) -> dict[str, Any]:
 #   voiceTables   num_oscillators x 22 pairs of [freq_x100:u32][range_pwm:u32]
 #   PWCenter / PWHighLimit / PWLowLimit   num_pw_channels x u16
 #   ManualOffset  num_oscillators x i8
+#   AmpComp440    num_oscillators x u16 (440 Hz manual anchor; 0 = never set)
+#   AmpCompDutyOffset  num_oscillators x i16 (duty target trim, 0.01% units)
 
 AMP_COMP_PAIRS = models.AMP_COMP_PAIRS
 
@@ -200,6 +202,8 @@ CAL_JSON_KEYS: dict[str, str] = {
     "pw_high_limit": "PWHighLimit",
     "pw_low_limit": "PWLowLimit",
     "manual_offset": "ManualOffset",
+    "amp_comp_440": "AmpComp440",
+    "amp_comp_duty": "AmpCompDutyOffset",
 }
 
 
@@ -247,6 +251,12 @@ def decode_cal_table(name: str, data: bytes) -> Any:
     if name == "ManualOffset":
         data = _clamp_cal_bytes(name, data, m.manual_offset_size)
         return list(struct.unpack(f"<{m.num_oscillators}b", data))
+    if name == "AmpComp440":
+        data = _clamp_cal_bytes(name, data, m.amp_comp_440_size)
+        return list(struct.unpack(f"<{m.num_oscillators}H", data))
+    if name == "AmpCompDutyOffset":
+        data = _clamp_cal_bytes(name, data, m.amp_comp_duty_size)
+        return list(struct.unpack(f"<{m.num_oscillators}h", data))
     raise ValueError(f"unknown calibration table {name}")
 
 
@@ -273,6 +283,16 @@ def encode_cal_table(name: str, value: Any) -> bytes:
             raise ValueError(f"ManualOffset needs {m.num_oscillators} values")
         return struct.pack(f"<{m.num_oscillators}b",
                            *(max(-128, min(127, int(v))) for v in value))
+    if name == "AmpComp440":
+        if len(value) != m.num_oscillators:
+            raise ValueError(f"AmpComp440 needs {m.num_oscillators} values")
+        return struct.pack(f"<{m.num_oscillators}H",
+                           *(max(0, min(0xFFFF, int(v))) for v in value))
+    if name == "AmpCompDutyOffset":
+        if len(value) != m.num_oscillators:
+            raise ValueError(f"AmpCompDutyOffset needs {m.num_oscillators} values")
+        return struct.pack(f"<{m.num_oscillators}h",
+                           *(max(-32768, min(32767, int(v))) for v in value))
     raise ValueError(f"unknown calibration table {name}")
 
 

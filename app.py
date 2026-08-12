@@ -44,7 +44,7 @@ PARAM_BY_PID = {p.pid: p for p in params.PARAMS}
 # are skipped at build time, so these tuples stay the superset.
 OSC_PITCH_PIDS = (13, 14, 33, 15, 34)
 OSC_SYNC_PIDS = (31, 36, 37, 17)
-OSC_VOICE_PIDS = (26, 27, 18, 32, 28, 29, 30, 43, 21)
+OSC_VOICE_PIDS = (26, 102, 27, 18, 32, 28, 29, 30, 43, 21)
 OSC_LEVEL_PIDS = (22, 23, 38, 24)
 OSC_WAVE_MATRIX = [
     ("OSC1", (1, 2, 3)),
@@ -99,6 +99,9 @@ PID_MANUAL_CAL_MODE = 151
 PID_MANUAL_CAL_STAGE = 152
 PID_MANUAL_CAL_OFFSET = 153
 PID_MANUAL_CAL_STORE = 156
+PID_MANUAL_CAL_STEP = 158
+PID_AMP_COMP_440 = 159
+PID_AMP_COMP_DUTY_OFFSET = 161
 
 
 def _bind_scale_jump(scale: ttk.Scale, on_change) -> None:
@@ -231,6 +234,17 @@ class App:
         self._manual_cal_dirty: set[int] = set()
         self._manual_cal_syncing = False
         self._manual_cal_indicator: ttk.Label | None = None
+        # Same recall/dirty tracking for the 440 Hz anchor values (AmpComp440).
+        self._amp440_live: list[int] | None = None
+        self._amp440_baseline: list[int] | None = None
+        self._amp440_dirty: set[int] = set()
+        # Wire-value offset the calibration stage buttons add for precision:
+        # 0 Normal, +4 Fine (refine stored table), +8 Fast (quick test table).
+        self._cal_precision_var = tk.IntVar(value=0)
+        # And for the duty target trims (AmpCompDutyOffset), stored by the same button.
+        self._dutytrim_live: list[int] | None = None
+        self._dutytrim_baseline: list[int] | None = None
+        self._dutytrim_dirty: set[int] = set()
         self._pulse_buttons: dict[int, ttk.Button] = {}
         self._tab_canvases: list[tk.Canvas] = []
         self._wheel_canvas: tk.Canvas | None = None
@@ -593,7 +607,7 @@ class App:
         return True
 
     def _cal_dump_to_file(self) -> None:
-        """Pull all five calibration tables off the board, then ask where to save."""
+        """Pull every calibration table off the board, then ask where to save."""
         if not self._mcu_ready():
             return
         names = list(mcu_link.cal_tables())
@@ -776,19 +790,34 @@ class App:
                 row = self._add_manual_cal_indicator(inner, row)
                 self._wire_manual_cal_recall()
                 row = self._add_pio_pulse_slider(inner, row)
-                panel = self._add_diag_panel(
-                    inner, row=row, column=0, title="Dev tables",
-                    commands=params.CAL_DEBUG_COMMANDS,
-                    note="PARAM_DEBUG_COMMAND 30: force-write fake amp-comp + PW "
-                         "to LittleFS (development placeholder).",
+                row = self._add_cal_diag_panel(
+                    inner, row, "Dev tables", params.CAL_DEBUG_COMMANDS,
+                    "Seed force-writes fake amp-comp + PW tables (development "
+                    "placeholder). Verify sweep replays the stored tables through "
+                    "the runtime lookup and prints [CAL_VERIFY] duty errors.",
                 )
-                panel.grid_configure(columnspan=3, sticky="ew")
-                # Single-button panel: place button + note without diag reflow.
-                for i, btn in enumerate(panel._diag_buttons):  # type: ignore[attr-defined]
-                    btn.grid(row=i, column=0, sticky="w", pady=1)
-                panel._diag_note_label.grid(  # type: ignore[attr-defined]
-                    row=len(panel._diag_buttons), column=0, sticky="w", pady=(4, 0))  # type: ignore[attr-defined]
-                self._add_cal_backup_panel(inner, row + 1)
+                row = self._add_cal_diag_panel(
+                    inner, row, "Amp-comp calibration method",
+                    models.filter_debug_commands(params.AMP_CAL_METHOD_COMMANDS),
+                    "Search used to build the amp-comp tables. Runtime-only (boot default "
+                    "AUTOTUNE_AMP_METHOD_DEFAULT); FREQ_TRACE needs the stored 440 Hz anchors.",
+                )
+                row = self._add_cal_diag_panel(
+                    inner, row, "Frequency search convergence",
+                    models.filter_debug_commands(params.FREQ_SEARCH_MODE_COMMANDS),
+                    "How the frequency search closes in once it brackets the answer. "
+                    "Runtime-only (boot default INTERP); compare probes= and elapsed= "
+                    "on the [CAL_REPORT] footer at the same dutyErr.",
+                )
+                row = self._add_cal_diag_panel(
+                    inner, row, "Amp-comp-0 endpoint (lowest frequency)",
+                    models.filter_debug_commands(params.AMP0_MODE_COMMANDS),
+                    "Pair 0 of the amp-comp table. MEASURE hunts for it live at amp "
+                    "comp 0; CALC skips the hunt and stores the least-squares fit "
+                    "through the lowest measured rungs. Runtime-only (boot default "
+                    "MEASURE).",
+                )
+                self._add_cal_backup_panel(inner, row)
                 inner.columnconfigure(1, weight=1)
             else:
                 row = 0
@@ -1244,7 +1273,7 @@ class App:
 
             def on_slide(_v, pid=p.pid, var=var, rd=readout):
                 rd.config(text=str(ivar(var)))
-                if self._preset_loading:
+                if self._preset_loading or self._manual_cal_syncing:
                     return
                 self.queue_param(pid, ivar(var))
 
@@ -1272,18 +1301,73 @@ class App:
             self._wire_check(parent, p, row=row, column=1)
 
         elif p.kind == "pulse":
-            def on_pulse(pid=p.pid, value=p.pulse_value, label=p.label):
-                if not self._confirm_pulse(pid):
-                    return
-                self.send_now(protocol.param16(pid, value))
-                self.log(f"[send] {label} (param {pid} = {value})\n")
-                self._on_pulse_sent(pid)
+            if p.pid == PID_RUN_AUTOTUNE:
+                # One value per calibration stage, so this param needs a strip.
+                self._add_cal_run_buttons(parent, p, row=row, pady=row_pad)
+            else:
+                def on_pulse(pid=p.pid, value=p.pulse_value, label=p.label):
+                    if not self._confirm_pulse(pid):
+                        return
+                    self.send_now(protocol.param16(pid, value))
+                    self.log(f"[send] {label} (param {pid} = {value})\n")
+                    self._on_pulse_sent(pid)
 
-            btn = ttk.Button(parent, text="Send", command=on_pulse)
-            btn.grid(row=row, column=1, sticky="w", pady=row_pad)
-            self._pulse_buttons[p.pid] = btn
+                btn = ttk.Button(parent, text="Send", command=on_pulse)
+                btn.grid(row=row, column=1, sticky="w", pady=row_pad)
+                self._pulse_buttons[p.pid] = btn
 
         return row + 1
+
+    def _add_cal_run_buttons(self, parent: ttk.Frame, p: params.Param, *,
+                             row: int, pady: int) -> None:
+        """Param 150 button strip: one button per calibration stage, plus Stop.
+
+        The value picks the stage on the board (amp-comp tables, PW center and
+        limits, or both); 0 cancels a run that is blocking the board's core 1,
+        discarding the partial results of the interrupted stage. The precision
+        radio adds an offset to the stage value: Normal (+0) builds from
+        scratch, Fine (+4) measures far more carefully and makes the amp stage
+        refine the stored table instead of building a new one (so it needs a
+        calibrated board already), Fast (+8) is the quickest from-scratch
+        build for a testing table.
+        """
+        strip = ttk.Frame(parent)
+        strip.grid(row=row, column=1, columnspan=2, sticky="w", pady=pady)
+
+        precision_names = {off: name for name, off in params.CAL_PRECISION_CHOICES}
+
+        for col, (text, value) in enumerate(params.CAL_SCOPE_BUTTONS):
+            def on_run(value=value, text=text):
+                if not self._confirm_pulse(PID_RUN_AUTOTUNE):
+                    return
+                offset = int(self._cal_precision_var.get())
+                wire = value + offset
+                precision = precision_names.get(offset, "Normal")
+                self.send_now(protocol.param16(PID_RUN_AUTOTUNE, wire))
+                self.log(f"[send] Run {text} calibration "
+                         f"({precision.lower()}) "
+                         f"(param {PID_RUN_AUTOTUNE} = {wire})\n")
+                self._on_pulse_sent(PID_RUN_AUTOTUNE)
+
+            btn = ttk.Button(strip, text=text, command=on_run)
+            btn.grid(row=0, column=col, sticky="w", padx=(0 if col == 0 else 4, 0))
+            if value == params.CAL_SCOPE_FULL:
+                self._pulse_buttons[p.pid] = btn
+
+        def on_stop():
+            self.send_now(protocol.param16(PID_RUN_AUTOTUNE, 0))
+            self.log(f"[send] Stop calibration (param {PID_RUN_AUTOTUNE} = 0)\n")
+
+        ttk.Button(strip, text="Stop", command=on_stop).grid(
+            row=0, column=len(params.CAL_SCOPE_BUTTONS), sticky="w", padx=(12, 0))
+
+        radios = ttk.Frame(strip)
+        radios.grid(row=0, column=len(params.CAL_SCOPE_BUTTONS) + 1,
+                    sticky="w", padx=(12, 0))
+        for rcol, (name, offset) in enumerate(params.CAL_PRECISION_CHOICES):
+            ttk.Radiobutton(radios, text=name, value=offset,
+                            variable=self._cal_precision_var).grid(
+                row=0, column=rcol, sticky="w", padx=(0 if rcol == 0 else 6, 0))
 
     def _add_block(self, parent: ttk.Frame, block: params.Block, row: int,
                    *, columnspan: int = 3) -> int:
@@ -1328,41 +1412,81 @@ class App:
     def _update_manual_cal_indicator(self) -> None:
         if self._manual_cal_indicator is None:
             return
+        dirty = self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty
         if self._manual_cal_live is None:
-            text = ("Manual cal offsets: not read from the board yet -- enable "
+            text = ("Manual cal values: not read from the board yet -- enable "
                     "Manual calibration mode to recall the stored values.")
-        elif self._manual_cal_dirty:
-            oscs = ", ".join(str(i) for i in sorted(self._manual_cal_dirty))
-            text = (f"Manual cal offsets: unsaved changes for oscillator(s) {oscs} -- "
+        elif dirty:
+            oscs = ", ".join(str(i) for i in sorted(dirty))
+            text = (f"Manual cal values: unsaved changes for oscillator(s) {oscs} -- "
                     "press Store manual cal offsets before running autotune, or they "
                     "will be discarded.")
         else:
-            text = "Manual cal offsets: matches what's stored on the board."
+            text = "Manual cal values: matches what's stored on the board."
         self._manual_cal_indicator.config(text=text)
 
     def _wire_manual_cal_recall(self) -> None:
-        """Hook the manual-cal mode/stage/offset vars so the offset slider always
-        reflects the real per-oscillator value instead of whatever it last showed."""
+        """Hook the manual-cal mode/stage/offset/440-value vars so the sliders
+        always reflect the real per-oscillator values instead of whatever they
+        last showed."""
         self.param_vars[PID_MANUAL_CAL_MODE].trace_add("write", self._manual_cal_on_mode_changed)
         self.param_vars[PID_MANUAL_CAL_STAGE].trace_add("write", self._manual_cal_on_stage_changed)
         self.param_vars[PID_MANUAL_CAL_OFFSET].trace_add("write", self._manual_cal_on_offset_changed)
+        self.param_vars[PID_AMP_COMP_440].trace_add("write", self._manual_cal_on_amp440_changed)
+        self.param_vars[PID_AMP_COMP_DUTY_OFFSET].trace_add(
+            "write", self._manual_cal_on_dutytrim_changed)
 
     def _manual_cal_on_mode_changed(self, *_args) -> None:
         if self._manual_cal_syncing or self._preset_loading:
             return
         if ivar(self.param_vars[PID_MANUAL_CAL_MODE]) == 0:
             return
-        if self._manual_cal_live is not None and self._manual_cal_dirty:
+        if self._manual_cal_live is not None and (self._manual_cal_dirty or self._amp440_dirty
+                                                  or self._dutytrim_dirty):
             # Unsaved edits pending -- don't clobber them with a stale flash re-dump.
             self._manual_cal_sync_offset_slider()
             return
         self._manual_cal_refresh_from_board()
 
     def _manual_cal_refresh_from_board(self) -> None:
-        """Recall the board's stored ManualOffset table via the existing cal-dump path."""
+        """Recall the stored ManualOffset + AmpComp440 + duty trim tables via the
+        cal-dump path."""
         if not self._mcu_ready():
-            self.log("[mcu] can't recall manual cal offsets -- not connected\n")
+            self.log("[mcu] can't recall manual cal values -- not connected\n")
             return
+
+        def dutytrim_done(ok, payload):
+            if not ok:
+                self.log(f"[mcu] duty trim recall failed: {payload}\n")
+                return
+            try:
+                values = fileformats.decode_cal_table("AmpCompDutyOffset", payload)
+            except ValueError as exc:
+                self.log(f"[mcu] duty trim recall: {exc}\n")
+                return
+            self._dutytrim_live = list(values)
+            self._dutytrim_baseline = list(values)
+            self._dutytrim_dirty.clear()
+            self._manual_cal_sync_offset_slider()
+            self._update_manual_cal_indicator()
+            self.log(f"[mcu] duty trims recalled: {values}\n")
+
+        def amp440_done(ok, payload):
+            if not ok:
+                self.log(f"[mcu] amp comp 440 recall failed: {payload}\n")
+                return
+            try:
+                values = fileformats.decode_cal_table("AmpComp440", payload)
+            except ValueError as exc:
+                self.log(f"[mcu] amp comp 440 recall: {exc}\n")
+                return
+            self._amp440_live = list(values)
+            self._amp440_baseline = list(values)
+            self._amp440_dirty.clear()
+            self._manual_cal_sync_offset_slider()
+            self._update_manual_cal_indicator()
+            self.log(f"[mcu] amp comp 440 values recalled: {values}\n")
+            self.mcu.dump_cal_table("AmpCompDutyOffset", dutytrim_done)
 
         def done(ok, payload):
             if not ok:
@@ -1384,11 +1508,12 @@ class App:
             self._manual_cal_sync_offset_slider()
             self._update_manual_cal_indicator()
             self.log(f"[mcu] manual cal offsets recalled: {values}\n")
+            self.mcu.dump_cal_table("AmpComp440", amp440_done)
 
         self.mcu.dump_cal_table("ManualOffset", done)
 
     def _manual_cal_sync_offset_slider(self) -> None:
-        """Show the cached offset for whichever oscillator stage is selected."""
+        """Show the cached offset, 440 Hz value and duty trim for the selected stage."""
         if self._manual_cal_live is None:
             return
         stage = max(0, min(len(self._manual_cal_live) - 1,
@@ -1396,9 +1521,44 @@ class App:
         self._manual_cal_syncing = True
         try:
             self.param_vars[PID_MANUAL_CAL_OFFSET].set(self._manual_cal_live[stage])
+            if self._amp440_live is not None and stage < len(self._amp440_live):
+                stored = self._amp440_live[stage]
+                slider_min = PARAM_BY_PID[PID_AMP_COMP_440].lo
+                slider_max = PARAM_BY_PID[PID_AMP_COMP_440].hi
+                # Driving the Scale with a value outside [lo, hi] clamps the
+                # widget and fires on_slide, which used to send the clamp (700)
+                # to the board and overwrite flash 0 / out-of-range anchors.
+                # Keep the cache as the real stored value; only the Scale stays
+                # where it is, and the readout shows the truth.
+                if slider_min <= stored <= slider_max:
+                    self.param_vars[PID_AMP_COMP_440].set(stored)
+                else:
+                    if stored > slider_max:
+                        self.log(f"[cal] osc {stage} amp comp @ 440 Hz is {stored}, "
+                                 f"above the slider maximum {slider_max}; the readout "
+                                 f"shows the stored value -- move the slider to dial "
+                                 f"a new one\n")
+                    else:
+                        what = "unset (0)" if stored == 0 else (
+                            f"{stored}, below the slider minimum {slider_min}")
+                        self.log(f"[cal] osc {stage} amp comp @ 440 Hz is {what}; "
+                                 f"the stored value is kept -- move the slider to "
+                                 f"dial a real anchor\n")
+            if self._dutytrim_live is not None and stage < len(self._dutytrim_live):
+                self.param_vars[PID_AMP_COMP_DUTY_OFFSET].set(self._dutytrim_live[stage])
         finally:
             self._manual_cal_syncing = False
         self._sync_readouts()
+        # _sync_readouts() copies the Scale var; an out-of-range 440 value was
+        # never written there, so restore the real number on the label.
+        if self._amp440_live is not None and stage < len(self._amp440_live):
+            stored = self._amp440_live[stage]
+            lo = PARAM_BY_PID[PID_AMP_COMP_440].lo
+            hi = PARAM_BY_PID[PID_AMP_COMP_440].hi
+            if not (lo <= stored <= hi):
+                rd = self._readouts.get(("p", PID_AMP_COMP_440))
+                if rd is not None:
+                    rd.config(text=str(stored))
 
     def _manual_cal_on_stage_changed(self, *_args) -> None:
         if self._manual_cal_syncing or self._manual_cal_live is None:
@@ -1419,25 +1579,60 @@ class App:
             self._manual_cal_dirty.discard(stage)
         self._update_manual_cal_indicator()
 
+    def _manual_cal_on_amp440_changed(self, *_args) -> None:
+        if self._manual_cal_syncing or self._amp440_live is None:
+            return
+        stage = max(0, min(len(self._amp440_live) - 1,
+                            ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
+        value = ivar(self.param_vars[PID_AMP_COMP_440])
+        self._amp440_live[stage] = value
+        baseline = self._amp440_baseline[stage] if self._amp440_baseline else 0
+        if value != baseline:
+            self._amp440_dirty.add(stage)
+        else:
+            self._amp440_dirty.discard(stage)
+        self._update_manual_cal_indicator()
+
+    def _manual_cal_on_dutytrim_changed(self, *_args) -> None:
+        if self._manual_cal_syncing or self._dutytrim_live is None:
+            return
+        stage = max(0, min(len(self._dutytrim_live) - 1,
+                            ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
+        value = ivar(self.param_vars[PID_AMP_COMP_DUTY_OFFSET])
+        self._dutytrim_live[stage] = value
+        baseline = self._dutytrim_baseline[stage] if self._dutytrim_baseline else 0
+        if value != baseline:
+            self._dutytrim_dirty.add(stage)
+        else:
+            self._dutytrim_dirty.discard(stage)
+        self._update_manual_cal_indicator()
+
     def _manual_cal_on_stored(self) -> None:
         if self._manual_cal_live is not None:
             self._manual_cal_baseline = list(self._manual_cal_live)
         self._manual_cal_dirty.clear()
+        if self._amp440_live is not None:
+            self._amp440_baseline = list(self._amp440_live)
+        self._amp440_dirty.clear()
+        if self._dutytrim_live is not None:
+            self._dutytrim_baseline = list(self._dutytrim_live)
+        self._dutytrim_dirty.clear()
         self._update_manual_cal_indicator()
 
     def _confirm_pulse(self, pid: int) -> bool:
-        """Gate a pulse Send: warn before Run autotune discards unsaved manual offsets."""
-        if pid != PID_RUN_AUTOTUNE or not self._manual_cal_dirty:
+        """Gate a calibration run: warn before it discards unsaved manual values."""
+        dirty = self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty
+        if pid != PID_RUN_AUTOTUNE or not dirty:
             return True
-        oscs = ", ".join(str(i) for i in sorted(self._manual_cal_dirty))
+        oscs = ", ".join(str(i) for i in sorted(dirty))
         choice = messagebox.askyesnocancel(
-            "Unsaved manual calibration offsets",
-            f"Oscillator(s) {oscs} have unsaved manual calibration offsets.\n\n"
+            "Unsaved manual calibration values",
+            f"Oscillator(s) {oscs} have unsaved manual calibration values.\n\n"
             "Auto calibration reloads the board's filesystem when it finishes, "
             "which discards any manual offset edit that wasn't stored.\n\n"
-            "Yes: store them now, then run autotune.\n"
-            "No: run autotune anyway and discard the unsaved edits.\n"
-            "Cancel: don't run autotune.",
+            "Yes: store them now, then calibrate.\n"
+            "No: calibrate anyway and discard the unsaved edits.\n"
+            "Cancel: don't calibrate.",
             parent=self.root,
         )
         if choice is None:
@@ -1454,21 +1649,62 @@ class App:
         if pid == PID_MANUAL_CAL_STORE:
             self._manual_cal_on_stored()
 
+    @staticmethod
+    def _note_tracks_width(frame: tk.Widget, label: ttk.Label, *,
+                           beside: tk.Widget | None = None, extra: int = 24) -> None:
+        """Wrap a note at the frame's live width instead of the fixed diag-tab 340 px.
+
+        The Calibration-tab panels span the whole tab, so a fixed wrap turns a
+        one-line note into a tall paragraph with empty space to its right.
+        """
+        last = {"wrap": -1}
+
+        def on_configure(event):
+            reserved = extra + (beside.winfo_width() if beside is not None else 0)
+            wrap = max(event.width - reserved, 160)
+            if abs(wrap - last["wrap"]) < 8:
+                return  # ignore the reflow our own wraplength change triggers
+            last["wrap"] = wrap
+            label.config(wraplength=wrap)
+
+        frame.bind("<Configure>", on_configure, add="+")
+
+    def _add_cal_diag_panel(self, parent: ttk.Frame, row: int, title: str,
+                            commands: tuple[tuple[str, int], ...], note: str) -> int:
+        """Calibration-tab debug button box: one button row, note underneath."""
+        if not commands:
+            return row
+        panel = self._add_diag_panel(parent, row=row, column=0, title=title,
+                                     commands=commands, note=note)
+        panel.grid_configure(columnspan=3, sticky="ew")
+        buttons: list[ttk.Button] = panel._diag_buttons  # type: ignore[attr-defined]
+        for i, btn in enumerate(buttons):
+            btn.grid(row=0, column=i, sticky="w", padx=(0 if i == 0 else 4, 0), pady=1)
+        note_label: ttk.Label = panel._diag_note_label  # type: ignore[attr-defined]
+        note_label.grid(row=1, column=0, columnspan=max(len(buttons), 1),
+                        sticky="w", pady=(2, 0))
+        self._note_tracks_width(panel, note_label)
+        return row + 1
+
     def _add_cal_backup_panel(self, parent: ttk.Frame, row: int) -> None:
-        """Calibration tab: dump/restore the board's five LittleFS cal tables."""
+        """Calibration tab: dump/restore the board's six LittleFS cal tables."""
         frame = ttk.LabelFrame(parent, text="Calibration backup", padding=8)
         frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
-        ttk.Button(frame, text="Dump board → file…",
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=0, column=0, sticky="w")
+        ttk.Button(buttons, text="Dump board → file…",
                    command=self._cal_dump_to_file).grid(row=0, column=0, sticky="w")
-        ttk.Button(frame, text="Load file → board…",
+        ttk.Button(buttons, text="Load file → board…",
                    command=self._cal_load_from_file).grid(row=0, column=1, sticky="w", padx=(6, 0))
-        ttk.Label(
+        note = ttk.Label(
             frame,
-            text=f"Amp-comp, PW and manual-offset tables as a {fileformats.cal_format()} JSON file. "
-                 "Loading overwrites the board's LittleFS calibration and reloads "
-                 "it live (needs a connected board).",
-            wraplength=700, style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+            text=f"All six cal tables as {fileformats.cal_format()} JSON; loading "
+                 "overwrites the board's LittleFS and reloads it live.",
+            style="Muted.TLabel",
+        )
+        note.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        frame.columnconfigure(1, weight=1)
+        self._note_tracks_width(frame, note, beside=buttons)
 
     def _add_diag_panel(self, parent: ttk.Frame, *, row: int, column: int, title: str,
                         commands: tuple[tuple[str, int], ...], note: str) -> ttk.LabelFrame:
@@ -1548,9 +1784,9 @@ class App:
         if models.active().has_mainboard:
             panel_specs.append(
                 ("Mainboard profiler", params.BENCH_MB_COMMANDS,
-                 "DCO forwards 40–42 to the STM32 Mainboard over Serial2; its ASCII "
+                 "DCO forwards 42 to the STM32 Mainboard over Serial2; its ASCII "
                  "dump comes back as text chunks into the Board output pane. Needs "
-                 "RUNNING_AVERAGE in the Mainboard firmware.", 2, 1))
+                 "RUNNING_AVERAGE in the Mainboard firmware. (40/41 are amp-0 mode.)", 2, 1))
         self._diag_panels = []
         for title, commands, note, grid_row, grid_col in panel_specs:
             frame = self._add_diag_panel(
@@ -1644,6 +1880,9 @@ class App:
         self.log_text.tag_configure("mcu", foreground=p["accent"])
 
     def log(self, text: str) -> None:
+        # Arduino Serial.println() is CRLF. Tk Text treats \r as a glyph, which
+        # showed up as a junk character on the short calibration-table dump lines.
+        text = text.replace("\r", "")
         # Tag our own lines so they read as commentary, leaving board output plain.
         tag = ""
         for name in ("link", "send", "ui", "mcu"):
@@ -1678,7 +1917,7 @@ class App:
         self._mcu_linebuf += chunk
         while "\n" in self._mcu_linebuf:
             line, self._mcu_linebuf = self._mcu_linebuf.split("\n", 1)
-            self.mcu.feed_line(line)
+            self.mcu.feed_line(line.rstrip("\r"))
         if len(self._mcu_linebuf) > 4096:  # runaway line; nothing we parse is this long
             self._mcu_linebuf = ""
 

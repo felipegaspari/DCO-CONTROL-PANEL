@@ -32,7 +32,7 @@ class ModelProfile:
     num_oscillators: int     # voiceTables / ManualOffset entry count (FS.h)
     num_pw_channels: int     # PWCenter / PWHighLimit / PWLowLimit entry count
     has_sub_engine: bool     # Sub-osc tab + params 90-99 (ENABLE_SUBOSC_ENGINE2)
-    has_mainboard: bool      # STM32 Mainboard behind Serial2 (profiler opcodes 40-42)
+    has_mainboard: bool      # STM32 Mainboard behind Serial2 (profiler opcode 42)
     osc_row_names: tuple[str, str, str]  # wave-matrix / UI row labels
     # Params kept in PARAMS (firmware routes them; presets/MIDI map keep them)
     # but hidden from the GUI on this model.
@@ -41,7 +41,7 @@ class ModelProfile:
     label_overrides: Mapping[int, str] = field(default_factory=dict)
     choice_overrides: Mapping[int, tuple] = field(default_factory=dict)
     note_overrides: Mapping[int, str] = field(default_factory=dict)
-    # Diagnostics-tab DEBUG_COMMANDS opcodes this model's firmware lacks.
+    # Debug-button opcodes this model's firmware lacks (Diagnostics + Calibration tabs).
     hidden_debug_values: frozenset[int] = frozenset()
     midi_target: str = "midi:dco"       # gen_midi_map Open Stage Control target
     panel_filename: str = "dco_panel.json"
@@ -62,6 +62,14 @@ class ModelProfile:
     @property
     def manual_offset_size(self) -> int:
         return self.num_oscillators
+
+    @property
+    def amp_comp_440_size(self) -> int:
+        return self.num_oscillators * 2
+
+    @property
+    def amp_comp_duty_size(self) -> int:
+        return self.num_oscillators * 2
 
 
 DCO3 = ModelProfile(
@@ -120,7 +128,8 @@ DCO4 = ModelProfile(
             "phase reset, which is 'Osc sync / phase align OSC B' below",
         37: "output on GP8, needs a mixer input on the carrier to be audible",
     }),
-    hidden_debug_values=frozenset({4}),  # Sub-osc engine report
+    # Sub-osc engine report (DCO4 has no ENABLE_SUBOSC_ENGINE2).
+    hidden_debug_values=frozenset({4}),
     midi_target="midi:dco4",
     panel_filename="dco4_panel.json",
 )

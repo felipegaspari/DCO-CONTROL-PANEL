@@ -183,22 +183,58 @@ bench-only buttons:
 | Filter | Cutoff, resonance, envelope and LFO amounts, keytrack, distortion Drive/Mix |
 | PWM | Pulse width, LFO2 and envelope to PW |
 | LFOs | Waveforms, speeds, and the LFO routing depths |
-| Calibration | Autotune, manual cal, PIO pulse (debug 160), fake-cal seed, **Calibration backup** (dump/load LittleFS tables ↔ `dco3-cal` file) |
+| Calibration | Run calibration (Amp comp / PW / Full / Stop + **Fine**), manual cal (two steps + duty trim), PIO pulse (debug 160), fake-cal seed and verify sweep (debug 36), **amp-comp calibration method** (debug 34/35), **Calibration backup** (dump/load LittleFS tables ↔ `dco3-cal` file) |
 | Character | Master Character amount (ParamId 221) plus diagnostic noise jitters via debug 160 (`0xC8` / `0xCA` / `0xCB`); see [`docs/CHARACTER.md`](../DCO/docs/CHARACTER.md) |
 | Diagnostics | PIO topology / period probes and hot-path profiler buttons |
 
-**Calibration backup** (connected board): **Dump board → file…** pulls all five tables
+**Calibration backup** (connected board): **Dump board → file…** pulls all seven tables
 (`[dump]` text) into a `dco3-cal` JSON; **Load file → board…** bulk-pushes present tables
 and the firmware reloads them live. Partial files only overwrite tables they contain.
 
-**Manual calibration offsets** (params 151–153, 156): the board only ever persists these
-to flash when you press **Store manual cal offsets** — moving the stage slider or leaving
-manual mode does not save. To avoid the offset slider showing a stale/wrong value, enabling
-**Manual calibration mode** recalls the real stored offsets from the board (reusing the same
+**Manual calibration** (params 151–153, 156, 158–159, 161): step 0 is the trimpot stage at the
+low starting note; **Manual cal step (440 Hz)** switches to step 1, where **Amp comp @ 440 Hz**
+sets the per-oscillator anchor value the FREQ_TRACE method needs (a seed — auto-cal re-measures
+it and writes the corrected value back). That slider spans 700..2800 (`DIV_COUNTER` × 0.05 .. × 0.2,
+where a true 440 Hz lands); the firmware accepts 0..`DIV_COUNTER`, and a recalled value that does
+not fit on the slider is logged rather than silently misdisplayed. **Duty trim (0.01%)** is the per-oscillator offset
+between the board's own 50% and the 50% a scope reads on the pulse output: put a scope on the
+output during manual step 1, dial the trim until the scope says 50%, and every calibrated point
+then lands on a true 50%. The board only ever persists offsets, 440 Hz values and duty trims
+when you press **Store manual cal offsets** — moving the stage slider or leaving manual mode
+does not save. To avoid the sliders showing stale/wrong values, enabling
+**Manual calibration mode** recalls all three stored tables from the board (reusing the same
 dump machinery as Calibration backup), and switching the stage slider shows that oscillator's
-correct cached value. A status line under the buttons flags any oscillator with unsaved
-edits, and pressing **Run autotune** while edits are unsaved asks first, since autotune
+correct cached values. A status line under the buttons flags any oscillator with unsaved
+edits, and starting a calibration while edits are unsaved asks first, since the run
 reloads the filesystem when it finishes and would otherwise silently discard them.
+
+**Verify sweep** (Dev tables → debug 36): a read-only pass that plays notes across the range
+with the amp comp taken from the runtime lookup and prints `[CAL_VERIFY]` lines with the duty
+error found at each note, plus the duty change one amp-comp count would make there. Use it after
+a run to see whether the residual error is a constant offset (dial the duty trim), a bump
+between table points (interpolation), or the count floor at the low notes.
+
+**Run calibration** (param 150): the PW and amp-comp stages are independent, so the row has
+one button per stage — **Amp comp** (value 1), **PW** (2), **Full** (3) — plus **Stop**
+(0), which cancels a run in progress and keeps the interrupted stage's previous values.
+An amp-comp run reuses the PW center already stored on the board. The same values are what
+the board's own calibration menu tabs send.
+
+**Fine (refine stored table)**: with the checkbox ticked the three stage buttons send
+value + 4 (5/6/7), which runs the same stage with much more careful measurements. In fine
+mode the amp-comp stage does not rebuild anything: it keeps every amp-comp value already
+stored on the board and only re-measures the frequency each one really sits at, so it needs
+a board that has been calibrated at least once (otherwise it prints `[CAL_REFINE_GUARD]`
+and keeps the table). Use normal for building a table, fine as a second pass afterwards.
+The board's own menu always runs normal.
+
+**Amp-comp calibration method** (debug 34/35): picks which search a normal run uses to
+build the tables — `CLASSIC` (per-note PWM search) or `FREQ_TRACE` (fixed-PWM
+frequency bisection, which needs the 440 Hz anchor stored for every oscillator). A fine
+run re-measures whatever is stored and ignores this setting. The method is
+runtime-only: the board reverts to its `AUTOTUNE_AMP_METHOD_DEFAULT` build flag on reboot,
+and the live one is reported as `amp_cal=` on the profiler `engine:` line (Diagnostics →
+Dump profiler once). See [`DCO/docs/CALIBRATION_PROCEDURE.md`](../DCO/docs/CALIBRATION_PROCEDURE.md).
 
 Anything the board prints — topology report, profiler tables, `[dump]`/`[pdir]`/`[preset]`/
 `[bulk]` lines, `DCO_DEBUG_REPORT`, autotune progress — lands in the **Board output** pane.

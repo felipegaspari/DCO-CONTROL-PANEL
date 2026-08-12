@@ -228,6 +228,29 @@ _ENV_DECAY_CURVES = (
     ("7 - ALMOST LIN", 7),
 )
 
+# Value of param 150 = which auto-calibration stage runs (CalibrationScope in
+# DCO/autotune.h; same order as the board's calibration menu tabs). 0 cancels.
+CAL_SCOPE_AMP = 1
+CAL_SCOPE_PW = 2
+CAL_SCOPE_FULL = 3
+CAL_SCOPE_BUTTONS: tuple[tuple[str, int], ...] = (
+    ("Amp comp", CAL_SCOPE_AMP),
+    ("PW", CAL_SCOPE_PW),
+    ("Full", CAL_SCOPE_FULL),
+)
+
+# Added to the stage value to pick the precision (CalPrecision in
+# DCO/autotune.h). FINE (5/6/7) measures far more carefully, and the amp stage
+# then re-measures the stored table instead of building a new one. FAST
+# (9/10/11) is the quickest from-scratch build - a table for testing.
+CAL_PRECISION_FINE_OFFSET = 4
+CAL_PRECISION_FAST_OFFSET = 8
+CAL_PRECISION_CHOICES: tuple[tuple[str, int], ...] = (
+    ("Fast", CAL_PRECISION_FAST_OFFSET),
+    ("Normal", 0),
+    ("Fine", CAL_PRECISION_FINE_OFFSET),
+)
+
 
 PARAMS: list[Param] = [
     # --- Oscillators (pitch, sync, voice, levels, wave enables) ---
@@ -263,10 +286,24 @@ PARAMS: list[Param] = [
           cc=23),
     Param(26, "Voice mode", GROUP_OSC, "combo", default=0,
           choices=(("0 - mono", 0), ("1 - poly", 1), ("2 - stack", 2)),
-          note="Mono (`0`) uses a last-note-priority held-note stack (overlapping keys; "
-               "release falls back and retriggers porta). See [`REFERENCE_AI.md`]"
-               "(REFERENCE_AI.md) (`note_on` / `note_off`).",
+          note="Mono (`0`) keeps a held-note stack, so overlapping keys fall back and "
+               "retrigger porta on release; which of the held keys sounds is 'Voice alloc / "
+               "note priority' below. See [`REFERENCE_AI.md`](REFERENCE_AI.md) "
+               "(`note_on` / `note_off`).",
           cc=69),
+    Param(102, "Voice alloc / note priority", GROUP_OSC, "combo", default=0,
+          choices=(("0 - round-robin / last note", 0),
+                   ("1 - oldest / first note", 1),
+                   ("2 - quietest / last note", 2),
+                   ("3 - quietest, keep lowest / low note", 3),
+                   ("4 - quietest, keep highest / high note", 4),
+                   ("5 - no stealing / first note, deny", 5)),
+          note="One setting, two jobs. In poly/para it is the steal policy used when every "
+               "voice is busy; in mono it is which held key sounds. Every stealing mode takes "
+               "an idle voice first, then the quietest release tail, and only steals a held "
+               "note as a last resort. `5` drops the note-on instead of stealing. See "
+               "[`REFERENCE_AI.md`](REFERENCE_AI.md) (`voice_alloc`).",
+          cc=78),
     Param(27, "Unison detune", GROUP_OSC, "slider", 0, 127, 0, cc=70),
     Param(18, "Portamento time", GROUP_OSC, "slider", 0, 255, 0, cc=71),
     Param(32, "Portamento mode", GROUP_OSC, "combo", default=0,
@@ -432,10 +469,28 @@ PARAMS: list[Param] = [
     # --- Calibration ---
     # The two pulses keep cc=None on purpose: autotune takes over the board for a minute
     # and the store writes the filesystem, neither of which should be one stray CC away.
-    Param(150, "Run autotune", GROUP_CAL, "pulse", pulse_value=1),
-    Param(151, "Manual calibration mode", GROUP_CAL, "check", default=0, cc=78),
+    Param(150, "Run calibration", GROUP_CAL, "pulse", pulse_value=CAL_SCOPE_FULL),
+    # Gave up CC 78 to the voice alloc selector: the CC map is full, and a bench
+    # mode reached from the panel is worth less on a knob than a playing control.
+    Param(151, "Manual calibration mode", GROUP_CAL, "check", default=0),
+    # hi is rewritten in apply_model() from the profile's oscillator count
+    # (0..2 DCO3, 0..7 DCO4). The 2 here is only the dco3 table default.
     Param(152, "Manual cal stage (osc)", GROUP_CAL, "slider", 0, 2, 0, cc=79),
     Param(153, "Manual cal offset", GROUP_CAL, "slider", -20, 20, 0, cc=80),
+    # Step 2 of manual cal: run the osc at 440 Hz and dial the absolute amp-comp
+    # value until GAP reads ~0. Stored value anchors the FREQ_TRACE method.
+    # A measured curve puts a true 440 Hz around a tenth of the range PWM
+    # (DIV_COUNTER in DCO/globals.h, 14000), so the slider spans a twentieth to a
+    # fifth of it: usable resolution around the working range, headroom above it,
+    # and nothing below where a healthy oscillator could sit. The firmware still
+    # clamps at DIV_COUNTER and still treats 0 as "never set", so a board outside
+    # this range can be driven over MIDI or by a stored table.
+    Param(158, "Manual cal step (440 Hz)", GROUP_CAL, "check", default=0),
+    Param(159, "Amp comp @ 440 Hz", GROUP_CAL, "slider", 700, 2800, 700),
+    # Duty target trim for the selected osc, in hundredths of a percent: the
+    # board's sense pin and a scope disagree on where 50% is, so dial this
+    # until the scope reads 50% and every calibrated point follows.
+    Param(161, "Duty trim (0.01%)", GROUP_CAL, "slider", -500, 500, 0),
     Param(156, "Store manual cal offsets", GROUP_CAL, "pulse", pulse_value=1),
 ]
 
@@ -505,11 +560,10 @@ BENCH_COMMANDS = (
 )
 
 # Mainboard profiler (PARAM_DEBUG_COMMAND 160), DCO4-REBORN only (has_mainboard).
-# DCO forwards 40-42 over Serial2; the STM32 dumps ASCII back as slim 't' chunks
-# into the Board output pane. Needs RUNNING_AVERAGE on the Mainboard.
+# 40/41 are amp-0 mode on both firmwares; DCO4 still forwards 42 over Serial2.
+# The STM32 dumps ASCII back as slim 't' chunks into the Board output pane.
+# Needs RUNNING_AVERAGE on the Mainboard.
 BENCH_MB_COMMANDS = (
-    ("Dump Mainboard once", 40),
-    ("Reset Mainboard profiler", 41),
     ("Toggle Mainboard ~1 Hz dump", 42),
 )
 
@@ -541,6 +595,34 @@ CLKDIV_HP_COMMANDS = (
 # Calibration-tab debug actions (PARAM_DEBUG_COMMAND 160). Not synth params.
 CAL_DEBUG_COMMANDS = (
     ("Seed fake calibration tables", 30),
+    ("Verify sweep (measure stored tables)", 36),
+)
+
+# Auto-cal amp-comp method A/B (PARAM_DEBUG_COMMAND 160). Runtime-only: the board
+# reverts to AUTOTUNE_AMP_METHOD_DEFAULT on reboot. See DCO/docs/AUTOTUNE.md.
+AMP_CAL_METHOD_COMMANDS = (
+    ("Amp cal: CLASSIC (per-note PWM)", 34),
+    ("Amp cal: FREQ_TRACE (freq bisection)", 35),
+)
+
+# How the frequency search closes in on a bracketed answer (PARAM_DEBUG_COMMAND
+# 160), same A/B shape as the method buttons above: runtime-only, the board goes
+# back to AUTOTUNE_SEARCH_MODE_DEFAULT (INTERP) on reboot. Judge a mode by the
+# probes= and elapsed= figures on the [CAL_REPORT] footer at the same dutyErr.
+FREQ_SEARCH_MODE_COMMANDS = (
+    ("Search: BISECT (midpoint, sign only)", 37),
+    ("Search: INTERP (Illinois secant)", 38),
+    ("Search: GATED (secant above noise)", 39),
+)
+
+# How the amp-comp-0 endpoint (pair 0, the lowest reachable frequency) is
+# obtained (PARAM_DEBUG_COMMAND 160). MEASURE runs the live band scan + search;
+# CALC skips the hunt and stores the least-squares fit through the lowest
+# measured rungs. Runtime-only, the board boots back to
+# AUTOTUNE_AMP0_MODE_DEFAULT (MEASURE).
+AMP0_MODE_COMMANDS = (
+    ("Amp-0: MEASURE (live hunt)", 40),
+    ("Amp-0: CALC (bottom-rung fit)", 41),
 )
 
 # PIO reset pulse Y (cycles). Sent as unsigned 16-bit on PARAM_DEBUG_COMMAND 160;
@@ -592,6 +674,9 @@ def apply_model(profile: models.ModelProfile) -> None:
                 c for c in p.choices if c[1] not in _SUB_ONLY_MOD_DEST_VALUES)
         if p.pid in profile.hidden_pids:
             changes["hidden"] = True
+        # Manual-cal stage is one slider per oscillator (0..2 DCO3, 0..7 DCO4).
+        if p.pid == 152:
+            changes["hi"] = profile.num_oscillators - 1
         rebuilt.append(dataclasses.replace(p, **changes) if changes else p)
     PARAMS[:] = rebuilt
 
