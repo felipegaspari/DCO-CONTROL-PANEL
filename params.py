@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 
+import calstages
 import models
 import protocol
 
@@ -467,26 +468,37 @@ PARAMS: list[Param] = [
     Param(221, "Character", GROUP_CHARACTER, "slider", 0, 128, 0),
 
     # --- Calibration ---
-    # The two pulses keep cc=None on purpose: autotune takes over the board for a minute
-    # and the store writes the filesystem, neither of which should be one stray CC away.
+    # No CC on this tab: autotune takes over the board, store writes the
+    # filesystem, and the stage walk is a packed index (DCO3 0..8 / DCO4 0..27)
+    # that a 7-bit knob cannot address sanely. Serial / Screen / this GUI only.
     Param(150, "Run calibration", GROUP_CAL, "pulse", pulse_value=CAL_SCOPE_FULL),
     # Gave up CC 78 to the voice alloc selector: the CC map is full, and a bench
     # mode reached from the panel is worth less on a knob than a playing control.
     Param(151, "Manual calibration mode", GROUP_CAL, "check", default=0),
-    # hi is rewritten in apply_model() from the profile's oscillator count
-    # (0..2 DCO3, 0..7 DCO4). The 2 here is only the dco3 table default.
-    Param(152, "Manual cal stage (osc)", GROUP_CAL, "slider", 0, 2, 0, cc=79),
-    Param(153, "Manual cal offset", GROUP_CAL, "slider", -20, 20, 0, cc=80),
-    # Step 2 of manual cal: run the osc at 440 Hz and dial the absolute amp-comp
-    # value until GAP reads ~0. Stored value anchors the FREQ_TRACE method.
+    # Substage walk, not an oscillator index: DCO3 0..8 (3 osc x saw/pulse/440),
+    # DCO4 0..27 (7 per voice pair, A saw/tri/pulse-PW/440 + B saw/pulse/440).
+    # hi is rewritten in apply_model() from calstages; the 8 here is the dco3
+    # table default. The GUI drives this from oscillator + substage selectors
+    # (app.py _add_manual_cal_stage_row).
+    Param(152, "Manual cal stage", GROUP_CAL, "slider", 0, 8, 0),
+    Param(153, "Manual cal offset", GROUP_CAL, "slider", -20, 20, 0),
+    # The 440 Hz substages of the walk: run the osc at 440 Hz and dial the
+    # absolute amp-comp value until GAP reads ~0. Stored value anchors the
+    # FREQ_TRACE method. (PARAM_MANUAL_CALIBRATION_STEP, 158, is not listed: the
+    # DCO derives the step from the stage kind, so a second control for it would
+    # only fight the walk.)
     # A measured curve puts a true 440 Hz around a tenth of the range PWM
     # (DIV_COUNTER in DCO/globals.h, 14000), so the slider spans a twentieth to a
     # fifth of it: usable resolution around the working range, headroom above it,
     # and nothing below where a healthy oscillator could sit. The firmware still
     # clamps at DIV_COUNTER and still treats 0 as "never set", so a board outside
     # this range can be driven over MIDI or by a stored table.
-    Param(158, "Manual cal step (440 Hz)", GROUP_CAL, "check", default=0),
     Param(159, "Amp comp @ 440 Hz", GROUP_CAL, "slider", 700, 2800, 700),
+    # DCO4 A oscillators only: the pulse-PW substage dials PW_CENTER for that
+    # voice's PW channel, since the A pulse has no analog switch and its PW CV
+    # is its on/off. Hidden on the monosynth walk, which has no such substage.
+    # Range is CAL_PW_CENTER_MAX (params_def.h) = DIV_COUNTER_PW - 1.
+    Param(162, "PW center (cal)", GROUP_CAL, "slider", 0, 1023, 512),
     # Duty target trim for the selected osc, in hundredths of a percent: the
     # board's sense pin and a scope disagree on where 50% is, so dial this
     # until the scope reads 50% and every calibrated point follows.
@@ -560,11 +572,21 @@ BENCH_COMMANDS = (
 )
 
 # Mainboard profiler (PARAM_DEBUG_COMMAND 160), DCO4-REBORN only (has_mainboard).
-# 40/41 are amp-0 mode on both firmwares; DCO4 still forwards 42 over Serial2.
+# 40/41 are amp-0 mode on the DCO, so dump-once is 45 (DCO forwards 42 and 45).
 # The STM32 dumps ASCII back as slim 't' chunks into the Board output pane.
 # Needs RUNNING_AVERAGE on the Mainboard.
 BENCH_MB_COMMANDS = (
+    ("Dump Mainboard profiler once", 45),
     ("Toggle Mainboard ~1 Hz dump", 42),
+)
+
+# MCP4728 I2C DACs (PARAM_DEBUG_COMMAND 160). Shown on both models.
+# DCO4 forwards 43/44 to the STM32 Mainboard (same Serial2 path as opcode 42);
+# DCO3 runs them on the DCO when ENABLE_MCP4728 is on, else prints compiled-out.
+# Probe is diagnostic only and does not mute analog writes.
+MCP_DAC_COMMANDS = (
+    ("MCP4728 probe", 43),
+    ("MCP4728 reattach", 44),
 )
 
 # Amp-comp method + benches (PARAM_DEBUG_COMMAND 160). Method select always acks;
@@ -593,9 +615,12 @@ CLKDIV_HP_COMMANDS = (
 )
 
 # Calibration-tab debug actions (PARAM_DEBUG_COMMAND 160). Not synth params.
+# The PW CV probe only answers while manual calibration is running (it reads the
+# duty of the soloed oscillator); off a pulse substage the board says so.
 CAL_DEBUG_COMMANDS = (
     ("Seed fake calibration tables", 30),
     ("Verify sweep (measure stored tables)", 36),
+    ("PW CV probe (needs manual cal)", 46),
 )
 
 # Auto-cal amp-comp method A/B (PARAM_DEBUG_COMMAND 160). Runtime-only: the board
@@ -674,9 +699,12 @@ def apply_model(profile: models.ModelProfile) -> None:
                 c for c in p.choices if c[1] not in _SUB_ONLY_MOD_DEST_VALUES)
         if p.pid in profile.hidden_pids:
             changes["hidden"] = True
-        # Manual-cal stage is one slider per oscillator (0..2 DCO3, 0..7 DCO4).
+        # Manual-cal stage counts substages (0..8 DCO3, 0..27 DCO4).
         if p.pid == 152:
-            changes["hi"] = profile.num_oscillators - 1
+            changes["hi"] = calstages.stage_max()
+        # PW center is dialled on the packed walk's pulse-PW substage only.
+        if p.pid == 162 and not calstages.is_packed():
+            changes["hidden"] = True
         rebuilt.append(dataclasses.replace(p, **changes) if changes else p)
     PARAMS[:] = rebuilt
 

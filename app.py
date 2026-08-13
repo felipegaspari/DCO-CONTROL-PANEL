@@ -21,6 +21,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import calstages
 import fileformats
 import mcu_link
 import models
@@ -99,9 +100,18 @@ PID_MANUAL_CAL_MODE = 151
 PID_MANUAL_CAL_STAGE = 152
 PID_MANUAL_CAL_OFFSET = 153
 PID_MANUAL_CAL_STORE = 156
-PID_MANUAL_CAL_STEP = 158
 PID_AMP_COMP_440 = 159
 PID_AMP_COMP_DUTY_OFFSET = 161
+PID_CAL_PW_CENTER = 162
+
+# Manual-cal controls only one kind of substage listens to. The others are
+# disabled as the walk moves, so nothing is dialled into a stage that ignores it
+# (the duty trim is per oscillator and stays live everywhere).
+CAL_KIND_PIDS = {
+    PID_MANUAL_CAL_OFFSET: (calstages.KIND_SAW, calstages.KIND_TRI, calstages.KIND_PULSE),
+    PID_CAL_PW_CENTER: (calstages.KIND_PULSE_PW,),
+    PID_AMP_COMP_440: (calstages.KIND_440,),
+}
 
 
 def _bind_scale_jump(scale: ttk.Scale, on_change) -> None:
@@ -226,18 +236,33 @@ class App:
         self._clean_fp = ""
         self._preset_loading = False
         # Manual calibration offset recall: seeded once from the board's stored
-        # ManualOffset table, then cached locally so switching oscillator stage
-        # never overwrites an unsaved edit with a stale re-dump (see
-        # _wire_manual_cal_recall / docs/PRESET_STORE.md).
+        # ManualOffset table, then cached locally so walking the stages never
+        # overwrites an unsaved edit with a stale re-dump (see
+        # _wire_manual_cal_recall / docs/PRESET_STORE.md). Every one of these
+        # caches is indexed by oscillator, which the stage only maps to through
+        # calstages.stage_to_osc().
         self._manual_cal_live: list[int] | None = None
         self._manual_cal_baseline: list[int] | None = None
         self._manual_cal_dirty: set[int] = set()
         self._manual_cal_syncing = False
         self._manual_cal_indicator: ttk.Label | None = None
+        # Manual-cal stage row widgets (oscillator + substage selectors).
+        self._cal_osc_var: tk.StringVar | None = None
+        self._cal_sub_var: tk.StringVar | None = None
+        self._cal_sub_combo: ttk.Combobox | None = None
+        self._cal_sub_kinds: tuple[int, ...] = ()
+        self._cal_stage_readout: ttk.Label | None = None
+        # Rows that only apply to some substages, disabled on the others.
+        self._cal_kind_rows: dict[int, tuple[ttk.Label, ttk.Scale]] = {}
         # Same recall/dirty tracking for the 440 Hz anchor values (AmpComp440).
         self._amp440_live: list[int] | None = None
         self._amp440_baseline: list[int] | None = None
         self._amp440_dirty: set[int] = set()
+        # PW centers (PWCenter), dialled on the packed walk's pulse-PW substage.
+        # Indexed by PW channel (calstages.pw_channel), not by oscillator.
+        self._pwcenter_live: list[int] | None = None
+        self._pwcenter_baseline: list[int] | None = None
+        self._pwcenter_dirty: set[int] = set()
         # Wire-value offset the calibration stage buttons add for precision:
         # 0 Normal, +4 Fine (refine stored table), +8 Fast (quick test table).
         self._cal_precision_var = tk.IntVar(value=0)
@@ -1265,7 +1290,11 @@ class App:
         if p.note:
             self._tooltip(label, p.note)
 
-        if p.kind == "slider":
+        if p.pid == PID_MANUAL_CAL_STAGE:
+            # Packed substage walk: selectors, not a raw index (see calstages).
+            self._add_manual_cal_stage_selectors(parent, p, row=row, pady=row_pad)
+
+        elif p.kind == "slider":
             var = tk.DoubleVar(value=p.default)
             self.param_vars[p.pid] = var
             readout = ttk.Label(parent, width=6, text=str(p.default), anchor="e",
@@ -1277,10 +1306,12 @@ class App:
                     return
                 self.queue_param(pid, ivar(var))
 
-            _make_scale(parent, lo=p.lo, hi=p.hi, var=var, command=on_slide).grid(
-                row=row, column=1, sticky="ew", pady=row_pad)
+            scale = _make_scale(parent, lo=p.lo, hi=p.hi, var=var, command=on_slide)
+            scale.grid(row=row, column=1, sticky="ew", pady=row_pad)
             readout.grid(row=row, column=2, sticky="e", padx=(8, 0))
             self._readouts[("p", p.pid)] = readout
+            if p.pid in CAL_KIND_PIDS:
+                self._cal_kind_rows[p.pid] = (label, scale)
 
         elif p.kind == "combo":
             labels = [c[0] for c in p.choices]
@@ -1317,6 +1348,99 @@ class App:
                 self._pulse_buttons[p.pid] = btn
 
         return row + 1
+
+    def _add_manual_cal_stage_selectors(self, parent: ttk.Frame, p: params.Param, *,
+                                        row: int, pady: int) -> None:
+        """Param 152 row: pick an oscillator and a substage, send the stage value.
+
+        The wire value counts substages, and the walk is not uniform (DCO4 A
+        oscillators have a triangle and a PW substage its B sibling doesn't), so
+        a raw 0..27 slider says nothing about where it lands. The two selectors
+        are the walk the operator is actually doing; calstages turns them into
+        the stage byte and back.
+        """
+        var = tk.DoubleVar(value=p.default)
+        self.param_vars[p.pid] = var
+
+        strip = ttk.Frame(parent)
+        strip.grid(row=row, column=1, columnspan=2, sticky="ew", pady=pady)
+
+        osc_labels = [calstages.osc_label(o) for o in range(models.active().num_oscillators)]
+        self._cal_osc_var = tk.StringVar(value=osc_labels[0])
+        osc_combo = ttk.Combobox(strip, textvariable=self._cal_osc_var, values=osc_labels,
+                                 state="readonly", width=8)
+        osc_combo.grid(row=0, column=0, sticky="w")
+
+        self._cal_sub_var = tk.StringVar()
+        self._cal_sub_combo = ttk.Combobox(strip, textvariable=self._cal_sub_var,
+                                           state="readonly", width=12)
+        self._cal_sub_combo.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        self._cal_stage_readout = ttk.Label(strip, text="", style="Muted.TLabel")
+        self._cal_stage_readout.grid(row=0, column=2, sticky="w", padx=(12, 0))
+
+        osc_combo.bind("<<ComboboxSelected>>", self._manual_cal_on_osc_picked)
+        self._cal_sub_combo.bind("<<ComboboxSelected>>", self._manual_cal_on_substage_picked)
+        self._manual_cal_fill_substages(0, calstages.KIND_SAW)
+        self._manual_cal_update_stage_readout()
+
+    def _manual_cal_fill_substages(self, osc: int, keep_kind: int | None) -> None:
+        """Repopulate the substage combo for one oscillator's part of the walk."""
+        kinds = calstages.kinds_for_osc(osc)
+        self._cal_sub_kinds = kinds
+        self._cal_sub_combo.config(values=[calstages.kind_label(k) for k in kinds])
+        kind = keep_kind if keep_kind in kinds else kinds[0]
+        self._cal_sub_var.set(calstages.kind_label(kind))
+
+    def _manual_cal_selected_osc(self) -> int:
+        label = self._cal_osc_var.get()
+        for osc in range(models.active().num_oscillators):
+            if calstages.osc_label(osc) == label:
+                return osc
+        return 0
+
+    def _manual_cal_selected_kind(self) -> int:
+        label = self._cal_sub_var.get()
+        for kind in self._cal_sub_kinds:
+            if calstages.kind_label(kind) == label:
+                return kind
+        return calstages.KIND_SAW
+
+    def _manual_cal_on_osc_picked(self, _event=None) -> None:
+        osc = self._manual_cal_selected_osc()
+        # An A-only substage (triangle, pulse-PW) has no counterpart on B, so
+        # the walk falls back to that oscillator's first substage.
+        self._manual_cal_fill_substages(osc, self._manual_cal_selected_kind())
+        self._manual_cal_send_stage()
+
+    def _manual_cal_on_substage_picked(self, _event=None) -> None:
+        self._manual_cal_send_stage()
+
+    def _manual_cal_send_stage(self) -> None:
+        stage = calstages.stage_for(self._manual_cal_selected_osc(),
+                                    self._manual_cal_selected_kind())
+        self.param_vars[PID_MANUAL_CAL_STAGE].set(stage)
+        self._manual_cal_update_stage_readout()
+        if self._preset_loading or self._manual_cal_syncing:
+            return
+        self.queue_param(PID_MANUAL_CAL_STAGE, stage)
+
+    def _manual_cal_sync_stage_selectors(self) -> None:
+        """Point the selectors at whatever stage the var holds (recall, presets)."""
+        if self._cal_stage_readout is None:
+            return
+        stage = max(0, min(calstages.stage_max(),
+                           ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
+        osc = calstages.stage_to_osc(stage)
+        self._cal_osc_var.set(calstages.osc_label(osc))
+        self._manual_cal_fill_substages(osc, calstages.stage_kind(stage))
+        self._manual_cal_update_stage_readout()
+
+    def _manual_cal_update_stage_readout(self) -> None:
+        if self._cal_stage_readout is None:
+            return
+        self._cal_stage_readout.config(
+            text=calstages.stage_text(ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
 
     def _add_cal_run_buttons(self, parent: ttk.Frame, p: params.Param, *,
                              row: int, pady: int) -> None:
@@ -1409,16 +1533,25 @@ class App:
         self._update_manual_cal_indicator()
         return row + 1
 
+    def _manual_cal_all_dirty(self) -> bool:
+        return bool(self._manual_cal_dirty or self._amp440_dirty
+                    or self._dutytrim_dirty or self._pwcenter_dirty)
+
+    def _manual_cal_dirty_text(self) -> str:
+        """Name the unsaved slots the way the walk does: OSC 1B, PW ch 2."""
+        names = [f"OSC {calstages.osc_label(o)}" for o in
+                 sorted(self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty)]
+        names += [f"PW ch {c}" for c in sorted(self._pwcenter_dirty)]
+        return ", ".join(names)
+
     def _update_manual_cal_indicator(self) -> None:
         if self._manual_cal_indicator is None:
             return
-        dirty = self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty
         if self._manual_cal_live is None:
             text = ("Manual cal values: not read from the board yet -- enable "
                     "Manual calibration mode to recall the stored values.")
-        elif dirty:
-            oscs = ", ".join(str(i) for i in sorted(dirty))
-            text = (f"Manual cal values: unsaved changes for oscillator(s) {oscs} -- "
+        elif self._manual_cal_all_dirty():
+            text = (f"Manual cal values: unsaved changes for {self._manual_cal_dirty_text()} -- "
                     "press Store manual cal offsets before running autotune, or they "
                     "will be discarded.")
         else:
@@ -1435,25 +1568,44 @@ class App:
         self.param_vars[PID_AMP_COMP_440].trace_add("write", self._manual_cal_on_amp440_changed)
         self.param_vars[PID_AMP_COMP_DUTY_OFFSET].trace_add(
             "write", self._manual_cal_on_dutytrim_changed)
+        if PID_CAL_PW_CENTER in self.param_vars:
+            self.param_vars[PID_CAL_PW_CENTER].trace_add(
+                "write", self._manual_cal_on_pwcenter_changed)
+        self._manual_cal_apply_stage_enables()
 
     def _manual_cal_on_mode_changed(self, *_args) -> None:
         if self._manual_cal_syncing or self._preset_loading:
             return
         if ivar(self.param_vars[PID_MANUAL_CAL_MODE]) == 0:
             return
-        if self._manual_cal_live is not None and (self._manual_cal_dirty or self._amp440_dirty
-                                                  or self._dutytrim_dirty):
+        if self._manual_cal_live is not None and self._manual_cal_all_dirty():
             # Unsaved edits pending -- don't clobber them with a stale flash re-dump.
-            self._manual_cal_sync_offset_slider()
+            self._manual_cal_sync_controls()
             return
         self._manual_cal_refresh_from_board()
 
     def _manual_cal_refresh_from_board(self) -> None:
-        """Recall the stored ManualOffset + AmpComp440 + duty trim tables via the
-        cal-dump path."""
+        """Recall the stored ManualOffset + AmpComp440 + duty trim + PW center
+        tables via the cal-dump path."""
         if not self._mcu_ready():
             self.log("[mcu] can't recall manual cal values -- not connected\n")
             return
+
+        def pwcenter_done(ok, payload):
+            if not ok:
+                self.log(f"[mcu] PW center recall failed: {payload}\n")
+                return
+            try:
+                values = fileformats.decode_cal_table("PWCenter", payload)
+            except ValueError as exc:
+                self.log(f"[mcu] PW center recall: {exc}\n")
+                return
+            self._pwcenter_live = list(values)
+            self._pwcenter_baseline = list(values)
+            self._pwcenter_dirty.clear()
+            self._manual_cal_sync_controls()
+            self._update_manual_cal_indicator()
+            self.log(f"[mcu] PW centers recalled: {values}\n")
 
         def dutytrim_done(ok, payload):
             if not ok:
@@ -1467,9 +1619,10 @@ class App:
             self._dutytrim_live = list(values)
             self._dutytrim_baseline = list(values)
             self._dutytrim_dirty.clear()
-            self._manual_cal_sync_offset_slider()
+            self._manual_cal_sync_controls()
             self._update_manual_cal_indicator()
             self.log(f"[mcu] duty trims recalled: {values}\n")
+            self.mcu.dump_cal_table("PWCenter", pwcenter_done)
 
         def amp440_done(ok, payload):
             if not ok:
@@ -1483,7 +1636,7 @@ class App:
             self._amp440_live = list(values)
             self._amp440_baseline = list(values)
             self._amp440_dirty.clear()
-            self._manual_cal_sync_offset_slider()
+            self._manual_cal_sync_controls()
             self._update_manual_cal_indicator()
             self.log(f"[mcu] amp comp 440 values recalled: {values}\n")
             self.mcu.dump_cal_table("AmpCompDutyOffset", dutytrim_done)
@@ -1502,27 +1655,36 @@ class App:
             self._manual_cal_dirty.clear()
             self._manual_cal_syncing = True
             try:
+                # The board restarts its walk at stage 0 on every entry.
                 self.param_vars[PID_MANUAL_CAL_STAGE].set(0)
+                self._manual_cal_sync_stage_selectors()
             finally:
                 self._manual_cal_syncing = False
-            self._manual_cal_sync_offset_slider()
+            self._manual_cal_sync_controls()
             self._update_manual_cal_indicator()
             self.log(f"[mcu] manual cal offsets recalled: {values}\n")
             self.mcu.dump_cal_table("AmpComp440", amp440_done)
 
         self.mcu.dump_cal_table("ManualOffset", done)
 
-    def _manual_cal_sync_offset_slider(self) -> None:
-        """Show the cached offset, 440 Hz value and duty trim for the selected stage."""
+    def _manual_cal_stage(self) -> int:
+        return max(0, min(calstages.stage_max(),
+                          ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
+
+    def _manual_cal_osc(self) -> int:
+        """Oscillator the current stage trims. Never the stage value itself."""
+        return calstages.stage_to_osc(self._manual_cal_stage())
+
+    def _manual_cal_sync_controls(self) -> None:
+        """Show the cached values for the oscillator the current stage trims."""
         if self._manual_cal_live is None:
             return
-        stage = max(0, min(len(self._manual_cal_live) - 1,
-                            ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
+        osc = min(self._manual_cal_osc(), len(self._manual_cal_live) - 1)
         self._manual_cal_syncing = True
         try:
-            self.param_vars[PID_MANUAL_CAL_OFFSET].set(self._manual_cal_live[stage])
-            if self._amp440_live is not None and stage < len(self._amp440_live):
-                stored = self._amp440_live[stage]
+            self.param_vars[PID_MANUAL_CAL_OFFSET].set(self._manual_cal_live[osc])
+            if self._amp440_live is not None and osc < len(self._amp440_live):
+                stored = self._amp440_live[osc]
                 slider_min = PARAM_BY_PID[PID_AMP_COMP_440].lo
                 slider_max = PARAM_BY_PID[PID_AMP_COMP_440].hi
                 # Driving the Scale with a value outside [lo, hi] clamps the
@@ -1533,26 +1695,32 @@ class App:
                 if slider_min <= stored <= slider_max:
                     self.param_vars[PID_AMP_COMP_440].set(stored)
                 else:
+                    label = calstages.osc_label(osc)
                     if stored > slider_max:
-                        self.log(f"[cal] osc {stage} amp comp @ 440 Hz is {stored}, "
+                        self.log(f"[cal] osc {label} amp comp @ 440 Hz is {stored}, "
                                  f"above the slider maximum {slider_max}; the readout "
                                  f"shows the stored value -- move the slider to dial "
                                  f"a new one\n")
                     else:
                         what = "unset (0)" if stored == 0 else (
                             f"{stored}, below the slider minimum {slider_min}")
-                        self.log(f"[cal] osc {stage} amp comp @ 440 Hz is {what}; "
+                        self.log(f"[cal] osc {label} amp comp @ 440 Hz is {what}; "
                                  f"the stored value is kept -- move the slider to "
                                  f"dial a real anchor\n")
-            if self._dutytrim_live is not None and stage < len(self._dutytrim_live):
-                self.param_vars[PID_AMP_COMP_DUTY_OFFSET].set(self._dutytrim_live[stage])
+            if self._dutytrim_live is not None and osc < len(self._dutytrim_live):
+                self.param_vars[PID_AMP_COMP_DUTY_OFFSET].set(self._dutytrim_live[osc])
+            ch = calstages.pw_channel(osc)
+            if (PID_CAL_PW_CENTER in self.param_vars and self._pwcenter_live is not None
+                    and ch < len(self._pwcenter_live)):
+                self.param_vars[PID_CAL_PW_CENTER].set(self._pwcenter_live[ch])
         finally:
             self._manual_cal_syncing = False
+        self._manual_cal_apply_stage_enables()
         self._sync_readouts()
         # _sync_readouts() copies the Scale var; an out-of-range 440 value was
         # never written there, so restore the real number on the label.
-        if self._amp440_live is not None and stage < len(self._amp440_live):
-            stored = self._amp440_live[stage]
+        if self._amp440_live is not None and osc < len(self._amp440_live):
+            stored = self._amp440_live[osc]
             lo = PARAM_BY_PID[PID_AMP_COMP_440].lo
             hi = PARAM_BY_PID[PID_AMP_COMP_440].hi
             if not (lo <= stored <= hi):
@@ -1560,51 +1728,65 @@ class App:
                 if rd is not None:
                     rd.config(text=str(stored))
 
+    def _manual_cal_apply_stage_enables(self) -> None:
+        """Grey out the controls this substage's encoder does not drive."""
+        kind = calstages.stage_kind(self._manual_cal_stage())
+        for pid, (label, scale) in self._cal_kind_rows.items():
+            live = kind in CAL_KIND_PIDS[pid]
+            scale.state(["!disabled" if live else "disabled"])
+            # The theme draws a disabled Label as a filled box, which reads like
+            # a field rather than a dead control; mute the text instead.
+            label.configure(style="TLabel" if live else "Muted.TLabel")
+
     def _manual_cal_on_stage_changed(self, *_args) -> None:
-        if self._manual_cal_syncing or self._manual_cal_live is None:
+        if self._manual_cal_syncing:
             return
-        self._manual_cal_sync_offset_slider()
+        self._manual_cal_update_stage_readout()
+        if self._manual_cal_live is None:
+            self._manual_cal_apply_stage_enables()
+            return
+        self._manual_cal_sync_controls()
 
     def _manual_cal_on_offset_changed(self, *_args) -> None:
         if self._manual_cal_syncing or self._manual_cal_live is None:
             return
-        stage = max(0, min(len(self._manual_cal_live) - 1,
-                            ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
-        value = ivar(self.param_vars[PID_MANUAL_CAL_OFFSET])
-        self._manual_cal_live[stage] = value
-        baseline = self._manual_cal_baseline[stage] if self._manual_cal_baseline else 0
-        if value != baseline:
-            self._manual_cal_dirty.add(stage)
-        else:
-            self._manual_cal_dirty.discard(stage)
-        self._update_manual_cal_indicator()
+        self._manual_cal_track_edit(self._manual_cal_live, self._manual_cal_baseline,
+                                    self._manual_cal_dirty, self._manual_cal_osc(),
+                                    ivar(self.param_vars[PID_MANUAL_CAL_OFFSET]))
 
     def _manual_cal_on_amp440_changed(self, *_args) -> None:
         if self._manual_cal_syncing or self._amp440_live is None:
             return
-        stage = max(0, min(len(self._amp440_live) - 1,
-                            ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
-        value = ivar(self.param_vars[PID_AMP_COMP_440])
-        self._amp440_live[stage] = value
-        baseline = self._amp440_baseline[stage] if self._amp440_baseline else 0
-        if value != baseline:
-            self._amp440_dirty.add(stage)
-        else:
-            self._amp440_dirty.discard(stage)
-        self._update_manual_cal_indicator()
+        self._manual_cal_track_edit(self._amp440_live, self._amp440_baseline,
+                                    self._amp440_dirty, self._manual_cal_osc(),
+                                    ivar(self.param_vars[PID_AMP_COMP_440]))
 
     def _manual_cal_on_dutytrim_changed(self, *_args) -> None:
         if self._manual_cal_syncing or self._dutytrim_live is None:
             return
-        stage = max(0, min(len(self._dutytrim_live) - 1,
-                            ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
-        value = ivar(self.param_vars[PID_AMP_COMP_DUTY_OFFSET])
-        self._dutytrim_live[stage] = value
-        baseline = self._dutytrim_baseline[stage] if self._dutytrim_baseline else 0
-        if value != baseline:
-            self._dutytrim_dirty.add(stage)
+        self._manual_cal_track_edit(self._dutytrim_live, self._dutytrim_baseline,
+                                    self._dutytrim_dirty, self._manual_cal_osc(),
+                                    ivar(self.param_vars[PID_AMP_COMP_DUTY_OFFSET]))
+
+    def _manual_cal_on_pwcenter_changed(self, *_args) -> None:
+        if self._manual_cal_syncing or self._pwcenter_live is None:
+            return
+        self._manual_cal_track_edit(self._pwcenter_live, self._pwcenter_baseline,
+                                    self._pwcenter_dirty,
+                                    calstages.pw_channel(self._manual_cal_osc()),
+                                    ivar(self.param_vars[PID_CAL_PW_CENTER]))
+
+    def _manual_cal_track_edit(self, live: list[int], baseline: list[int] | None,
+                               dirty: set[int], index: int, value: int) -> None:
+        """Cache an edit and flag the slot when it no longer matches the board."""
+        if index >= len(live):
+            return
+        live[index] = value
+        stored = baseline[index] if baseline and index < len(baseline) else 0
+        if value != stored:
+            dirty.add(index)
         else:
-            self._dutytrim_dirty.discard(stage)
+            dirty.discard(index)
         self._update_manual_cal_indicator()
 
     def _manual_cal_on_stored(self) -> None:
@@ -1617,17 +1799,18 @@ class App:
         if self._dutytrim_live is not None:
             self._dutytrim_baseline = list(self._dutytrim_live)
         self._dutytrim_dirty.clear()
+        if self._pwcenter_live is not None:
+            self._pwcenter_baseline = list(self._pwcenter_live)
+        self._pwcenter_dirty.clear()
         self._update_manual_cal_indicator()
 
     def _confirm_pulse(self, pid: int) -> bool:
         """Gate a calibration run: warn before it discards unsaved manual values."""
-        dirty = self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty
-        if pid != PID_RUN_AUTOTUNE or not dirty:
+        if pid != PID_RUN_AUTOTUNE or not self._manual_cal_all_dirty():
             return True
-        oscs = ", ".join(str(i) for i in sorted(dirty))
         choice = messagebox.askyesnocancel(
             "Unsaved manual calibration values",
-            f"Oscillator(s) {oscs} have unsaved manual calibration values.\n\n"
+            f"{self._manual_cal_dirty_text()} have unsaved manual calibration values.\n\n"
             "Auto calibration reloads the board's filesystem when it finishes, "
             "which discards any manual offset edit that wasn't stored.\n\n"
             "Yes: store them now, then calibrate.\n"
@@ -1784,9 +1967,18 @@ class App:
         if models.active().has_mainboard:
             panel_specs.append(
                 ("Mainboard profiler", params.BENCH_MB_COMMANDS,
-                 "DCO forwards 42 to the STM32 Mainboard over Serial2; its ASCII "
-                 "dump comes back as text chunks into the Board output pane. Needs "
-                 "RUNNING_AVERAGE in the Mainboard firmware. (40/41 are amp-0 mode.)", 2, 1))
+                 "DCO forwards 45 (dump once) and 42 (toggle ~1 Hz) to the STM32 "
+                 "Mainboard over Serial2; ASCII comes back as text chunks into the "
+                 "Board output pane. Needs RUNNING_AVERAGE in the Mainboard firmware. "
+                 "(40/41 are amp-0 mode on the DCO, not Mainboard dump/reset.)", 2, 1))
+        mcp_row, mcp_col = (3, 0) if models.active().has_mainboard else (2, 1)
+        panel_specs.append(
+            ("MCP4728 DACs", params.MCP_DAC_COMMANDS,
+             "Output appears in the Board pane. DCO4 forwards 43/44 to the STM32 "
+             "Mainboard over Serial2 (same path as opcode 42). DCO3 runs them on "
+             "the DCO when ENABLE_MCP4728 is on; otherwise the board prints "
+             "mcp4728 compiled out. Probe does not mute analog writes.",
+             mcp_row, mcp_col))
         self._diag_panels = []
         for title, commands, note, grid_row, grid_col in panel_specs:
             frame = self._add_diag_panel(
@@ -1968,6 +2160,10 @@ class App:
         Calibration, Diagnostics, and bench/debug controls are omitted — those send
         only when the user operates them. Needed after connecting: the board boots
         with its own defaults and has no idea what this window is showing.
+
+        On models whose DCO relays Screen signals (has_screen_signals) the push is
+        bracketed by a Silent signal and a slot+name scroll, so the Screen follows
+        the panel's preset instead of the Input board's last selection.
         """
         if not self.link.is_open:
             self.log("[link] not connected\n")
@@ -1975,6 +2171,11 @@ class App:
         # UI is authoritative; drop any stale offline queue before the full push.
         self.pending.clear()
         n = 0
+        screen = models.active().has_screen_signals
+        if screen:
+            # Screen Silent first so toasts do not fight the later slot/name scroll.
+            self.send_now(protocol.screen_signal(protocol.SCREEN_SIGNAL_SILENT))
+            n += 1
         for p in presets.patch_params():
             self.queue_param(p.pid, self._param_value(p))
             n += 1
@@ -1982,6 +2183,14 @@ class App:
             self.queue_block(block.key)
             n += 1
         self._flush_pending()
+        if screen:
+            # 16-byte USB 'q' fills DCO presetName[]; then PARAM_UI_PRESET_SCROLL
+            # emits the 17-byte Screen 'q' + PresetScroll. Not PARAM_PRESET_LOAD
+            # (that would recall LittleFS instead of this PC bank).
+            self.send_now(protocol.preset_name(self.preset_name_var.get()))
+            self.send_now(protocol.param16(
+                protocol.PARAM_UI_PRESET_SCROLL, self._preset_slot_index()))
+            n += 2
         self.log(f"[send] patch {n} frames\n")
         return n
 

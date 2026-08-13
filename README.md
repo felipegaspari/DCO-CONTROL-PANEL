@@ -22,7 +22,8 @@ each project's `DCO/`. Everything model-specific lives in [`models.py`](models.p
 | Hidden params | — | OSC3 group (2-osc voices) |
 | Oscillator naming | OSC1/OSC2 | OSC A/OSC B |
 | Cal tables (amp-comp / PW / offsets) | 3 osc, 3 PW ch | 8 osc, 4 PW ch |
-| Mainboard profiler panel | no | yes (STM32 opcodes 40-42) |
+| Mainboard profiler panel | no | yes (STM32 opcodes 45 dump, 42 toggle) |
+| Screen signals on **Send all** | no | yes (`'s'` ScreenMode + param 174) |
 | Preset bank file | `presets/bank_dco3.json` | `presets/bank_dco4.json` |
 
 The model is **auto-detected from the USB product string** of the connected board;
@@ -36,12 +37,18 @@ per-model (`dco3-cal` / `dco4-cal`) because the table sizes differ.
 A pre-existing `presets/bank.json` (from before the tool was model-aware) is adopted
 by the first model that runs without its own bank file.
 
+Because each project holds its own checkout, edits made while working on one board can
+sit uncommitted and drift from the other copy. `python3 sync_checkouts.py` diffs the two
+(code only; preset banks are per-tree working data) and `--copy this|other` levels them.
+Anything genuinely model-specific belongs in a `ModelProfile`, never in one checkout.
+
 DCO4-REBORN topology note: the DCO's `Serial2` peer is the **STM32 Mainboard**, not the
 Input board. USB `'a'`/`'b'`/`'d'` blocks update DCO locals **and** are mirrored to the
 Mainboard's analog VCA/VCF CVs when Serial2 is up; `'c'` (EnvDCO) stays on the DCO. The
-Diagnostics tab gains a **Mainboard profiler** panel (opcodes 40–42 forwarded over
-Serial2, dump returns as `'t'` chunks into the Board output pane; needs Mainboard
-`RUNNING_AVERAGE` — see `DCO/docs/BENCHMARKING.md` §12 in DCO4-REBORN).
+Diagnostics tab gains a **Mainboard profiler** panel (opcodes 45 dump-once and 42
+toggle forwarded over Serial2; 40/41 are amp-0 on the DCO. Dump returns as `'t'`
+chunks into the Board output pane; needs Mainboard `RUNNING_AVERAGE` — see
+`DCO/docs/BENCHMARKING.md` §12 in DCO4-REBORN).
 
 ---
 
@@ -102,6 +109,12 @@ Pick the port and press **Connect**. The tool **automatically pushes the sound p
 with **Send all** (same set as presets: no Calibration, Diagnostics, or bench/debug).
 Loading / Prev / Next / Init while connected also push that patch only. Use **Send all**
 anytime to resync the patch after a board reset.
+
+On dco4 the push is bracketed by Screen signals: a `'s'` **Silent** before it, then the
+patch name (`'q'`) and `PARAM_UI_PRESET_SCROLL` (174) after it, so the Screen shows this
+window's slot and name instead of the Input board's last selection. dco3's DCO has no
+`'s'` / 174 handler yet, so `models.py` leaves `has_screen_signals` off there and the
+panel sends neither frame; flip that flag when the handlers land in its `DCO/Serial.ino`.
 
 When connected, patch sliders/combos/checks send live on change (coalesced ~20 ms).
 **Calibration**, **Diagnostics**, and **bench** controls are not stored and are sent
@@ -183,7 +196,7 @@ bench-only buttons:
 | Filter | Cutoff, resonance, envelope and LFO amounts, keytrack, distortion Drive/Mix |
 | PWM | Pulse width, LFO2 and envelope to PW |
 | LFOs | Waveforms, speeds, and the LFO routing depths |
-| Calibration | Run calibration (Amp comp / PW / Full / Stop + **Fine**), manual cal (two steps + duty trim), PIO pulse (debug 160), fake-cal seed and verify sweep (debug 36), **amp-comp calibration method** (debug 34/35), **Calibration backup** (dump/load LittleFS tables ↔ `dco3-cal` file) |
+| Calibration | Run calibration (Amp comp / PW / Full / Stop + **Fine**), manual cal (oscillator + substage walk, offset / PW center / 440 Hz anchor / duty trim), PIO pulse (debug 160), fake-cal seed and verify sweep (debug 36), **amp-comp calibration method** (debug 34/35), **Calibration backup** (dump/load LittleFS tables ↔ `dco3-cal` file) |
 | Character | Master Character amount (ParamId 221) plus diagnostic noise jitters via debug 160 (`0xC8` / `0xCA` / `0xCB`); see [`docs/CHARACTER.md`](../DCO/docs/CHARACTER.md) |
 | Diagnostics | PIO topology / period probes and hot-path profiler buttons |
 
@@ -191,28 +204,50 @@ bench-only buttons:
 (`[dump]` text) into a `dco3-cal` JSON; **Load file → board…** bulk-pushes present tables
 and the firmware reloads them live. Partial files only overwrite tables they contain.
 
-**Manual calibration** (params 151–153, 156, 158–159, 161): step 0 is the trimpot stage at the
-low starting note; **Manual cal step (440 Hz)** switches to step 1, where **Amp comp @ 440 Hz**
-sets the per-oscillator anchor value the FREQ_TRACE method needs (a seed — auto-cal re-measures
-it and writes the corrected value back). That slider spans 700..2800 (`DIV_COUNTER` × 0.05 .. × 0.2,
+**Manual calibration** (params 151–153, 156, 159, 161–162) walks substages, not oscillators.
+**Manual cal stage** is two selectors — the oscillator (`OSC1`–`OSC3` on the monosynth,
+`0A`/`0B`/`1A`… on DCO4) and the substage — which compute the stage value param **152**
+carries; the readout beside them shows what the board is on (`stage 12 — 1B Pulse`). DCO3
+walks saw → pulse → 440 Hz per oscillator (0..8); DCO4 packs seven per voice pair (0..27),
+its A oscillators adding a triangle and a pulse substage where the encoder sets `PW_CENTER`.
+The board derives the 440 Hz step from the stage, so there is no separate step control
+(param 158 is not sent by this tool).
+
+Each substage has one live control and the others are greyed out: **Manual cal offset** on
+saw/triangle/pulse, **PW center (cal)** on DCO4's pulse-PW substage (0..1023, `DIV_COUNTER_PW`
+− 1), and **Amp comp @ 440 Hz** on the 440 Hz substages, which sets the per-oscillator anchor
+value the FREQ_TRACE method needs (a seed — auto-cal re-measures it and writes the corrected
+value back). That slider spans 700..2800 (`DIV_COUNTER` × 0.05 .. × 0.2,
 where a true 440 Hz lands); the firmware accepts 0..`DIV_COUNTER`, and a recalled value that does
-not fit on the slider is logged rather than silently misdisplayed. **Duty trim (0.01%)** is the per-oscillator offset
+not fit on the slider is logged rather than silently misdisplayed. **Duty trim (0.01%)** stays live
+on every substage: it is the per-oscillator offset
 between the board's own 50% and the 50% a scope reads on the pulse output: put a scope on the
-output during manual step 1, dial the trim until the scope says 50%, and every calibrated point
-then lands on a true 50%. The board only ever persists offsets, 440 Hz values and duty trims
-when you press **Store manual cal offsets** — moving the stage slider or leaving manual mode
+output during a pulse substage, dial the trim until the scope says 50%, and every calibrated point
+then lands on a true 50%. The board only ever persists offsets, 440 Hz values, duty trims and PW
+centers when you press **Store manual cal offsets** — walking the stages or leaving manual mode
 does not save. To avoid the sliders showing stale/wrong values, enabling
-**Manual calibration mode** recalls all three stored tables from the board (reusing the same
-dump machinery as Calibration backup), and switching the stage slider shows that oscillator's
-correct cached values. A status line under the buttons flags any oscillator with unsaved
+**Manual calibration mode** recalls all four stored tables from the board (reusing the same
+dump machinery as Calibration backup), and each stage shows that oscillator's
+correct cached values — offsets, anchor and trim per oscillator, PW center per PW channel
+(`cal_pw_channel`, two oscillators to a channel on DCO4). A status line under the buttons flags
+any oscillator or PW channel with unsaved
 edits, and starting a calibration while edits are unsaved asks first, since the run
 reloads the filesystem when it finishes and would otherwise silently discard them.
+Full operator workflow: [`DCO-SHARED-LIBRARIES/docs/CALIBRATION_PROCEDURE.md`](../DCO-SHARED-LIBRARIES/docs/CALIBRATION_PROCEDURE.md).
 
 **Verify sweep** (Dev tables → debug 36): a read-only pass that plays notes across the range
 with the amp comp taken from the runtime lookup and prints `[CAL_VERIFY]` lines with the duty
 error found at each note, plus the duty change one amp-comp count would make there. Use it after
 a run to see whether the residual error is a constant offset (dial the duty trim), a bump
 between table points (interpolation), or the count floor at the low notes.
+
+**PW CV probe** (Dev tables → debug 46): only useful with manual calibration running, because it
+reads the duty of the soloed oscillator. It walks every PW channel through 0, ¼, ½, ¾ and full
+scale and prints `[PW_PROBE]` lines with the duty each level produced, then how far each channel
+moved the duty. Reach for it when a DCO4 A pulse stays audible while trimming its saw or triangle,
+or when PW center (param 162) does nothing: the expected channel moving the duty means the CV is
+live, another channel moving it means `PW_PINS` does not match the wiring, and nothing moving means
+the CV never reaches the analog board.
 
 **Run calibration** (param 150): the PW and amp-comp stages are independent, so the row has
 one button per stage — **Amp comp** (value 1), **PW** (2), **Full** (3) — plus **Stop**
@@ -363,6 +398,7 @@ a minute-long takeover of the board and the other writes the filesystem. Those s
 |------|------|
 | [`protocol.py`](protocol.py) | Frame builders (`'a'`–`'d'`, `'p'`, `'q'`, `'B'`, `'C'`), lin-to-exp, port detection |
 | [`params.py`](params.py) | The whole control surface as data; edit this to add a control |
+| [`calstages.py`](calstages.py) | The manual-cal substage walk (port of `cal_stage_*_n` / `cal_pw_channel`) |
 | [`presets.py`](presets.py) | Local 256-slot bank load/save, capture/apply of patch parameters |
 | [`presets/bank.json`](presets/bank.json) | Working program bank (slot 0 = Init); edit via the UI |
 | [`fileformats.py`](fileformats.py) | `dco3-patch` / `dco3-bank` / `dco3-cal` JSON + MCU record/cal codecs |
@@ -370,6 +406,7 @@ a minute-long takeover of the board and the other writes the filesystem. Those s
 | [`app.py`](app.py) | tkinter UI, preset browser, MCU sync, calibration backup |
 | [`theme.py`](theme.py) | Dark and light palettes, ttk styling, plain-Tk recolouring |
 | [`gen_midi_map.py`](gen_midi_map.py) | Emits the CC map, its chart and the panel session from `params.py` |
+| [`sync_checkouts.py`](sync_checkouts.py) | Diffs this checkout against the other project's copy; `--copy this\|other` resolves it |
 
 ### Adding a parameter
 

@@ -5,7 +5,7 @@ Three file kinds, all JSON with a "format" tag so they can't be mixed up
 
   <model>-patch  one preset slot (same shape presets.py stores in the bank)
   <model>-bank   a whole 256-slot bank
-  <model>-cal    the board's five calibration tables, decoded to numbers
+  <model>-cal    the board's seven calibration tables, decoded to numbers
 
 Patches and banks share one param numbering across both synths, so either
 model's file loads anywhere (params the other synth lacks fall back to

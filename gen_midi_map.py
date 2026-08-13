@@ -299,7 +299,8 @@ def validate_protocol(enum_by_id: dict[int, str]) -> list[str]:
             )
 
     for name in ("PARAM_PRESET_SAVE", "PARAM_PRESET_LOAD",
-                 "PARAM_PRESET_DUMP", "PARAM_CAL_DUMP"):
+                 "PARAM_PRESET_DUMP", "PARAM_CAL_DUMP",
+                 "PARAM_UI_PRESET_SCROLL"):
         pid = getattr(protocol, name)
         if enum_by_id.get(pid) != name:
             problems.append(

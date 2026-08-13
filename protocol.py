@@ -30,6 +30,12 @@ PARAM_PRESET_SAVE = 170  # value = slot: save the board's live state
 PARAM_PRESET_LOAD = 171  # value = slot: recall a slot on the board
 PARAM_PRESET_DUMP = 172  # -1 = directory listing, 0..255 = slot record hex
 PARAM_CAL_DUMP = 173     # 0/-1 = all cal tables, 1..7 = one
+PARAM_UI_PRESET_SCROLL = 174  # value = slot: Screen q + PresetScroll (not LittleFS)
+
+# ScreenMode byte on USB 's' (DCO Serial.ino relays to Mainboard). Not a CMD_*
+# name so gen_midi_map --check does not require INPUT_CMD_SCREEN_SIGNAL.
+SCREEN_SIGNAL_PRESET_SCROLL = 1
+SCREEN_SIGNAL_SILENT = 6
 
 # Bulk restore targets ('B'/'C' first payload byte, DCO/preset_store.h).
 BULK_TARGET_PRESET = 0
@@ -116,6 +122,11 @@ def preset_name(name: str) -> bytes:
     """'q' frame: 16 ASCII chars, space-padded."""
     padded = name.encode("ascii", errors="replace")[:16].ljust(16, b" ")
     return CMD_PRESET_NAME + padded
+
+
+def screen_signal(signal: int) -> bytes:
+    """'s' frame: one ScreenMode byte (Silent / PresetScroll). USB LUT relays it."""
+    return b"s" + bytes([signal & 0xFF])
 
 
 def bulk_chunk(target: int, slot: int, offset: int, data: bytes) -> bytes:

@@ -4,8 +4,8 @@ The tool is shared between DCO3-MONOSYNTH and DCO4-REBORN. Both firmwares speak
 the same slim serial protocol, preset-store record format and '[dump]' text
 protocol; what differs is the control surface (DCO3 has the dual sub-osc
 engine, DCO4 hides the OSC3 controls because its voices are 2-osc), the
-calibration table sizes (oscillator / PW channel counts) and the USB product
-string used for auto-detection.
+calibration table sizes (oscillator / PW channel counts), whether the DCO relays
+Screen signals for the host, and the USB product string used for auto-detection.
 
 Everything model-specific lives in a ModelProfile here. The active profile is
 chosen at startup — --model dco3|dco4, or auto-detected from the USB product
@@ -33,6 +33,10 @@ class ModelProfile:
     num_pw_channels: int     # PWCenter / PWHighLimit / PWLowLimit entry count
     has_sub_engine: bool     # Sub-osc tab + params 90-99 (ENABLE_SUBOSC_ENGINE2)
     has_mainboard: bool      # STM32 Mainboard behind Serial2 (profiler opcode 42)
+    # USB 's' ScreenMode relay + PARAM_UI_PRESET_SCROLL handlers in DCO/Serial.ino.
+    # Without them the Screen keeps showing whatever the Input board last wrote,
+    # so the panel skips those frames instead of sending ones the board drops.
+    has_screen_signals: bool
     osc_row_names: tuple[str, str, str]  # wave-matrix / UI row labels
     # Params kept in PARAMS (firmware routes them; presets/MIDI map keep them)
     # but hidden from the GUI on this model.
@@ -80,6 +84,7 @@ DCO3 = ModelProfile(
     num_pw_channels=3,
     has_sub_engine=True,
     has_mainboard=False,
+    has_screen_signals=False,
     osc_row_names=("OSC1", "OSC2", "OSC3"),
     midi_target="midi:dco3",
     panel_filename="dco3_panel.json",
@@ -96,6 +101,7 @@ DCO4 = ModelProfile(
     num_pw_channels=4,
     has_sub_engine=False,
     has_mainboard=True,
+    has_screen_signals=True,
     osc_row_names=("OSC A", "OSC B", "OSC3"),
     hidden_pids=frozenset({33, 34, 35, 38, 87, 88, 89, 218, 220}),
     label_overrides=MappingProxyType({
