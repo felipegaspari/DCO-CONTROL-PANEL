@@ -217,8 +217,10 @@ Each substage has one live control and the others are greyed out: **Manual cal o
 saw/triangle/pulse, **PW center (cal)** on DCO4's pulse-PW substage (0..1023, `DIV_COUNTER_PW`
 − 1), and **Amp comp @ 440 Hz** on the 440 Hz substages, which sets the per-oscillator anchor
 value the FREQ_TRACE method needs (a seed — auto-cal re-measures it and writes the corrected
-value back). That slider spans 700..2800 (`DIV_COUNTER` × 0.05 .. × 0.2,
-where a true 440 Hz lands); the firmware accepts 0..`DIV_COUNTER`, and a recalled value that does
+value back). That slider spans 700..2800 (`DIV_COUNTER` × 0.05 .. × 0.2,,
+parsed from `project_config.h`; at wrap 14000 that was 700..2800,
+where a true 440 Hz lands). The firmware accepts 0..`DIV_COUNTER`, and a recalled value that does
+
 not fit on the slider is logged rather than silently misdisplayed. **Duty trim (0.01%)** stays live
 on every substage: it is the per-oscillator offset
 between the board's own 50% and the 50% a scope reads on the pulse output: put a scope on the

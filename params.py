@@ -17,10 +17,29 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from pathlib import Path
+import re
 
+import calstages
 import calstages
 import models
 import protocol
+
+
+def _range_pwm_wrap() -> int:
+    """RANGE_PWM_WRAP from the superproject; 14000 if the header is missing."""
+    header = Path(__file__).resolve().parent.parent / "project_config.h"
+    try:
+        text = header.read_text()
+    except OSError:
+        return 14000
+    m = re.search(r"^\s*#\s*define\s+RANGE_PWM_WRAP\s+(\d+)", text, re.M)
+    return int(m.group(1)) if m else 14000
+
+
+RANGE_PWM_WRAP = _range_pwm_wrap()
+AMP_COMP_440_MIN = RANGE_PWM_WRAP // 20
+AMP_COMP_440_MAX = RANGE_PWM_WRAP // 5
 
 # Tab names, in display order.
 GROUP_OSC = "Oscillators"
@@ -488,12 +507,13 @@ PARAMS: list[Param] = [
     # DCO derives the step from the stage kind, so a second control for it would
     # only fight the walk.)
     # A measured curve puts a true 440 Hz around a tenth of the range PWM
-    # (DIV_COUNTER in DCO/globals.h, 14000), so the slider spans a twentieth to a
+    # (RANGE_PWM_WRAP in project_config.h), so the slider spans a twentieth to a
     # fifth of it: usable resolution around the working range, headroom above it,
     # and nothing below where a healthy oscillator could sit. The firmware still
     # clamps at DIV_COUNTER and still treats 0 as "never set", so a board outside
     # this range can be driven over MIDI or by a stored table.
-    Param(159, "Amp comp @ 440 Hz", GROUP_CAL, "slider", 700, 2800, 700),
+    Param(159, "Amp comp @ 440 Hz", GROUP_CAL, "slider",
+          AMP_COMP_440_MIN, AMP_COMP_440_MAX, AMP_COMP_440_MIN),
     # DCO4 A oscillators only: the pulse-PW substage dials PW_CENTER for that
     # voice's PW channel, since the A pulse has no analog switch and its PW CV
     # is its on/off. Hidden on the monosynth walk, which has no such substage.
