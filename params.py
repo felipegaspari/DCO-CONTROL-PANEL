@@ -21,7 +21,6 @@ from pathlib import Path
 import re
 
 import calstages
-import calstages
 import models
 import protocol
 

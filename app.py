@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""Bench controller for the DCO board.
-
-Drives the DCO's whole parameter surface over its USB serial port, so the board can be
-tested with no Input board and no Screen attached. Notes are not handled here: the DCO
-already enumerates as a USB MIDI device, so play it from a MIDI keyboard or VMPK.
-
-Requires the firmware to be built with ENABLE_USB_CONTROL (see DCO/DCO.ino).
-Match SERIAL_FRAMING_COBS with --cobs or DCO_SERIAL_COBS=1.
-
-    python3 app.py [--port /dev/ttyACM0] [--theme dark|light] [--cobs]
-"""
+"""Bench controller for the DCO board built with PySide6 (Qt6)."""
 
 from __future__ import annotations
 
@@ -18,8 +8,17 @@ import os
 import queue
 import sys
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
+    QSlider, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
+    QTabWidget, QVBoxLayout, QWidget, QMenu
+)
 
 import calstages
 import fileformats
@@ -28,21 +27,17 @@ import models
 import params
 import presets
 import protocol
-import theme
+import theme_qt as theme
 
 try:
     import serial
 except ImportError:
-    sys.exit("pyserial is required:  pacman -S python-pyserial   (or pip install pyserial)")
+    sys.exit("pyserial is required: pip install pyserial")
 
-# Coalesce slider drags into one write per interval (last-write-wins), so dragging
-# cannot flood the link — important once PIO pulse reloads running SMs.
 SEND_INTERVAL_MS = 20
-
 PARAM_BY_PID = {p.pid: p for p in params.PARAMS}
 
-# Oscillators tab layout (see _build_osc_tab). Pids a model hides (Param.hidden)
-# are skipped at build time, so these tuples stay the superset.
+# Layout constants
 OSC_PITCH_PIDS = (13, 14, 33, 15, 34)
 OSC_SYNC_PIDS = (31, 36, 37, 17)
 OSC_VOICE_PIDS = (26, 102, 27, 18, 32, 28, 29, 30, 43, 21)
@@ -54,13 +49,31 @@ OSC_WAVE_MATRIX = [
 ]
 OSC_WAVE_COLS = ("Saw", "Pulse", "Tri")
 
+ENV_ADSR_BLOCKS = ("adsr_vca", "adsr_vcf", "adsr_dco")
+ENV_CURVE_RESTART_PIDS = (8, 9, 48, 49, 50, 51)
+ENV_CURVE_COLUMNS = (
+    ("EnvVCA curves", 48, 49, 8),
+    ("EnvVCF curves", 50, 51, 9),
+    ("EnvDCO curves", None, None, None),
+)
+
+PID_RUN_AUTOTUNE = 150
+PID_MANUAL_CAL_MODE = 151
+PID_MANUAL_CAL_STAGE = 152
+PID_MANUAL_CAL_OFFSET = 153
+PID_MANUAL_CAL_STORE = 156
+PID_AMP_COMP_440 = 159
+PID_AMP_COMP_DUTY_OFFSET = 161
+PID_CAL_PW_CENTER = 162
+
+CAL_KIND_PIDS = {
+    PID_MANUAL_CAL_OFFSET: (calstages.KIND_SAW, calstages.KIND_TRI, calstages.KIND_PULSE),
+    PID_CAL_PW_CENTER: (calstages.KIND_PULSE_PW,),
+    PID_AMP_COMP_440: (calstages.KIND_440,),
+}
+
 
 def apply_active_model() -> None:
-    """Bake the active model profile into params and this module's tables.
-
-    Must run before App() is constructed (main() does it after --model /
-    auto-detection picks the profile).
-    """
     params.apply_model(models.active())
     PARAM_BY_PID.clear()
     PARAM_BY_PID.update({p.pid: p for p in params.PARAMS})
@@ -71,89 +84,16 @@ def apply_active_model() -> None:
         if not all(PARAM_BY_PID[pid].hidden for pid in pids)
     ]
 
-# Reflow Oscillators tab: stack Pitch|Sync over Voice below this width (px).
-OSC_SPLIT_STACK_WIDTH = 720
 
-# Diagnostics tab compact layout (see _build_diag_tab).
-DIAG_SPLIT_STACK_WIDTH = 720
-DIAG_FRAME_PAD = 4
-DIAG_SECTION_PADY = 4
-
-# Envelopes tab layout (see _build_env_tab).
-ENV_ADSR_BLOCKS = ("adsr_vca", "adsr_vcf", "adsr_dco")
-ENV_CURVE_RESTART_PIDS = (8, 9, 48, 49, 50, 51)
-ENV_CURVE_COLUMNS = (
-    ("EnvVCA curves", 48, 49, 8),
-    ("EnvVCF curves", 50, 51, 9),
-    ("EnvDCO curves", None, None, None),
-)
-ENV_ADSR_VFADER_MIN = 80
-ENV_ADSR_VFADER_MAX = 280
-ENV_ADSR_VIEWPORT_FRAC = 0.35
-
-JSON_FILETYPES = (("JSON files", "*.json"), ("All files", "*"))
-
-# Manual calibration param ids (DCO/params_def.h), used to wire live offset
-# recall and dirty-edit tracking on the Calibration tab (see _wire_manual_cal_recall).
-PID_RUN_AUTOTUNE = 150
-PID_MANUAL_CAL_MODE = 151
-PID_MANUAL_CAL_STAGE = 152
-PID_MANUAL_CAL_OFFSET = 153
-PID_MANUAL_CAL_STORE = 156
-PID_AMP_COMP_440 = 159
-PID_AMP_COMP_DUTY_OFFSET = 161
-PID_CAL_PW_CENTER = 162
-
-# Manual-cal controls only one kind of substage listens to. The others are
-# disabled as the walk moves, so nothing is dialled into a stage that ignores it
-# (the duty trim is per oscillator and stays live everywhere).
-CAL_KIND_PIDS = {
-    PID_MANUAL_CAL_OFFSET: (calstages.KIND_SAW, calstages.KIND_TRI, calstages.KIND_PULSE),
-    PID_CAL_PW_CENTER: (calstages.KIND_PULSE_PW,),
-    PID_AMP_COMP_440: (calstages.KIND_440,),
-}
-
-
-def _bind_scale_jump(scale: ttk.Scale, on_change) -> None:
-    """Button-1 on trough jumps to click position (clam default only steps)."""
-
-    def on_press(event):
-        part = scale.identify(event.x, event.y)
-        if part and ("trough" in str(part) or "track" in str(part)):
-            scale.set(scale.get(event.x, event.y))
-            on_change(str(scale.get()))
-            return "break"
-
-    scale.bind("<Button-1>", on_press, add="+")
-
-
-def _make_scale(parent, *, lo, hi, var, command, orient="horizontal", length=None) -> ttk.Scale:
-    kwargs: dict = dict(from_=lo, to=hi, variable=var, orient=orient, command=command)
-    if length is not None:
-        kwargs["length"] = length
-    scale = ttk.Scale(parent, **kwargs)
-    _bind_scale_jump(scale, command)
-    return scale
-
-
-def ivar(var: tk.Variable) -> int:
-    """Read a Tk variable as an int.
-
-    ttk.Scale always writes floats, so slider variables are DoubleVar and have to be
-    rounded on the way out rather than read as IntVar (which would raise on "3.5").
-    """
-    try:
-        return int(round(float(var.get())))
-    except (tk.TclError, ValueError):
-        return 0
+class LinkEmitter(QObject):
+    data_received = Signal(str)
+    write_failed = Signal(str)
 
 
 class Link:
-    """Serial connection plus a background reader for the board's debug output."""
-
-    def __init__(self) -> None:
-        self.port = None
-        self.rx: queue.Queue[str] = queue.Queue()
+    def __init__(self, emitter: LinkEmitter) -> None:
+        self.port: serial.Serial | None = None
+        self.emitter = emitter
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -186,243 +126,999 @@ class Link:
         try:
             self.port.write(frame)
         except OSError as exc:
-            self.rx.put(f"[link] write failed: {exc}\n")
+            self.emitter.write_failed.emit(str(exc))
             self.close()
 
     def _read_loop(self) -> None:
-        # The board only ever sends plain debug text back, never frames, so decode
-        # loosely and forward whatever arrives to the log pane.
         while not self._stop.is_set():
             try:
-                data = self.port.read(256)
+                data = self.port.read(256) if self.port else b""
             except (OSError, AttributeError, TypeError):
                 break
             if data:
-                self.rx.put(data.decode("utf-8", errors="replace"))
+                self.emitter.data_received.emit(data.decode("utf-8", errors="replace"))
 
 
-class App:
-    def __init__(
-        self,
-        root: tk.Tk,
-        preferred_port: str | None,
-        mode: str = "dark",
-        cobs: bool = False,
-    ) -> None:
+class App(QMainWindow):
+    def __init__(self, preferred_port: str | None, mode: str = "dark", cobs: bool = False) -> None:
+        super().__init__()
         protocol.use_cobs = cobs
-        self.root = root
-        self.link = Link()
-        # MCU preset/cal transfers ride the same CDC stream; the board's structured
-        # text answers ([dump]/[pdir]/...) are parsed out of the log feed.
-        self.mcu = mcu_link.McuLink(
-            lambda frame: self.link.send(protocol.stuff(frame)), self.log)
-        self._mcu_linebuf = ""
-        self.mcu_dir: dict[int, str] = {}  # slot -> name from the last [pdir] listing
-        self._browser: PresetBrowser | None = None
-        self.pending: dict[str, bytes] = {}  # dedup key -> most recent frame
-        self.param_vars: dict[int, tk.Variable] = {}
-        self.block_vars: dict[str, dict[str, tk.Variable]] = {}
-        # Scale readout Labels: ("p", pid), ("b", block_key, field_key),
-        # ("pio_pulse",), or ("char_jitter", hi).
-        # ttk.Scale often skips command on programmatic var.set(); we sync these after apply.
-        self._readouts: dict[tuple, ttk.Label] = {}
+        self.mode = mode
         self.blocks_by_key = {b.key: b for b in params.BLOCKS}
-        self.pio_pulse_var: tk.DoubleVar | None = None
-        # Character-tab diagnostic jitters (PARAM_DEBUG_COMMAND); not in presets / Send all.
-        self.character_jitter_vars: dict[int, tk.DoubleVar] = {}
-        self.mode = mode if mode in theme.MODES else "dark"
-        self.dot_on = False
-        self.bank = presets.empty_bank()
-        self._clean_fp = ""
-        self._preset_loading = False
-        # Manual calibration offset recall: seeded once from the board's stored
-        # ManualOffset table, then cached locally so walking the stages never
-        # overwrites an unsaved edit with a stale re-dump (see
-        # _wire_manual_cal_recall / docs/PRESET_STORE.md). Every one of these
-        # caches is indexed by oscillator, which the stage only maps to through
-        # calstages.stage_to_osc().
+
+        # Serial Link
+        self.link_emitter = LinkEmitter()
+        self.link_emitter.data_received.connect(self._on_data_received)
+        self.link_emitter.write_failed.connect(self._on_write_failed)
+        self.link = Link(self.link_emitter)
+
+        self.mcu = mcu_link.McuLink(
+            lambda frame: self.link.send(protocol.stuff(frame)), self.log
+        )
+        self._mcu_linebuf = ""
+        self.mcu_dir: dict[int, str] = {}
+        self._browser: PresetBrowser | None = None
+        self.pending: dict[str, bytes] = {}
+
+        # Widget Maps
+        self.param_widgets: dict[int, QWidget] = {}
+        self.block_widgets: dict[str, dict[str, QWidget]] = {}
+        self.character_jitter_sliders: dict[int, QSlider] = {}
+        self.pio_pulse_slider: QSlider | None = None
+        self._readouts: dict[tuple, QLabel] = {}
+
+        # Manual cal states
         self._manual_cal_live: list[int] | None = None
         self._manual_cal_baseline: list[int] | None = None
         self._manual_cal_dirty: set[int] = set()
         self._manual_cal_syncing = False
-        self._manual_cal_indicator: ttk.Label | None = None
-        # Manual-cal stage row widgets (oscillator + substage selectors).
-        self._cal_osc_var: tk.StringVar | None = None
-        self._cal_sub_var: tk.StringVar | None = None
-        self._cal_sub_combo: ttk.Combobox | None = None
+        self._manual_cal_indicator: QLabel | None = None
+        self._cal_osc_combo: QComboBox | None = None
+        self._cal_sub_combo: QComboBox | None = None
         self._cal_sub_kinds: tuple[int, ...] = ()
-        self._cal_stage_readout: ttk.Label | None = None
-        # Rows that only apply to some substages, disabled on the others.
-        self._cal_kind_rows: dict[int, tuple[ttk.Label, ttk.Scale]] = {}
-        # Same recall/dirty tracking for the 440 Hz anchor values (AmpComp440).
+        self._cal_stage_readout: QLabel | None = None
+        self._cal_kind_rows: dict[int, tuple[QLabel, QWidget]] = {}
+
         self._amp440_live: list[int] | None = None
         self._amp440_baseline: list[int] | None = None
         self._amp440_dirty: set[int] = set()
-        # PW centers (PWCenter), dialled on the packed walk's pulse-PW substage.
-        # Indexed by PW channel (calstages.pw_channel), not by oscillator.
+
         self._pwcenter_live: list[int] | None = None
         self._pwcenter_baseline: list[int] | None = None
         self._pwcenter_dirty: set[int] = set()
-        # Wire-value offset the calibration stage buttons add for precision:
-        # 0 Normal, +4 Fine (refine stored table), +8 Fast (quick test table).
-        self._cal_precision_var = tk.IntVar(value=0)
-        # And for the duty target trims (AmpCompDutyOffset), stored by the same button.
+
         self._dutytrim_live: list[int] | None = None
         self._dutytrim_baseline: list[int] | None = None
         self._dutytrim_dirty: set[int] = set()
-        self._pulse_buttons: dict[int, ttk.Button] = {}
-        self._tab_canvases: list[tk.Canvas] = []
-        self._wheel_canvas: tk.Canvas | None = None
-        self.notebook: ttk.Notebook | None = None
 
-        root.title(f"DCO bench controller — {models.active().display_name}")
-        # Wide enough that the toolbar's right-hand side is never squeezed out by pack().
-        root.geometry("1140x960")
-        root.minsize(900, 600)
-        # Before building, so every widget is created already styled.
-        theme.apply(root, self.mode)
+        self._cal_precision_offset = 0
+        self._pulse_buttons: dict[int, QPushButton] = {}
 
-        self._build_toolbar(preferred_port)
-        self._build_preset_bar()
-        self.paned = ttk.Panedwindow(root, orient=tk.VERTICAL)
-        self.paned.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self._build_tabs()
-        self._build_log()
+        self.bank = presets.empty_bank()
+        self._clean_fp = ""
+        self._preset_loading = False
+
+        # GUI Setup
+        self.setWindowTitle(f"DCO Bench Controller — {models.active().display_name}")
+        self.resize(1140, 920)
+        self.setMinimumSize(900, 600)
+        self._apply_theme()
+
+        self._build_ui(preferred_port)
         self._init_presets()
-        # The canvases and log pane are plain Tk and were created after apply()'s own pass.
-        theme.retint(root)
-        self._style_log_tags()
-        # Board output starts compact; drag the sash up when dumping profiler tables.
-        self.root.after_idle(self._shrink_log_pane)
 
-        self.root.after(SEND_INTERVAL_MS, self._flush)
-        self.root.after(50, self._drain_log)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Timers
+        self.flush_timer = QTimer(self)
+        self.flush_timer.timeout.connect(self._flush)
+        self.flush_timer.start(SEND_INTERVAL_MS)
 
-    # --- toolbar ---------------------------------------------------------
+        self.mcu_timer = QTimer(self)
+        self.mcu_timer.timeout.connect(self.mcu.tick)
+        self.mcu_timer.start(50)
 
-    def _build_toolbar(self, preferred_port: str | None) -> None:
-        bar = ttk.Frame(self.root, padding=(8, 6))
-        bar.pack(fill="x")
+    def _apply_theme(self) -> None:
+        self.setStyleSheet(theme.build_stylesheet(self.mode))
 
-        ttk.Label(bar, text="Port").pack(side="left")
-        self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(bar, textvariable=self.port_var, width=28, state="readonly")
-        self.port_combo.pack(side="left", padx=6)
+    def _toggle_theme(self) -> None:
+        self.mode = "light" if self.mode == "dark" else "dark"
+        self._apply_theme()
+        self.theme_btn.setText("Light" if self.mode == "dark" else "Dark")
+
+    # --- UI Layout Builders ---
+
+    def _build_ui(self, preferred_port: str | None) -> None:
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
+
+        # Toolbar & Preset Bar
+        main_layout.addWidget(self._build_toolbar(preferred_port))
+        main_layout.addWidget(self._build_preset_bar())
+
+        # Vertical Splitter (Tabs + Log)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        main_layout.addWidget(self.splitter, 1)
+
+        self.tabs = QTabWidget()
+        self.splitter.addWidget(self.tabs)
+        self._build_tabs()
+
+        self.log_pane = self._build_log_pane()
+        self.splitter.addWidget(self.log_pane)
+        self.splitter.setStretchFactor(0, 5)
+        self.splitter.setStretchFactor(1, 1)
+
+    def _build_toolbar(self, preferred_port: str | None) -> QWidget:
+        bar = QFrame()
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        lay.addWidget(QLabel("Port"))
+        self.port_combo = QComboBox()
+        self.port_combo.setMinimumWidth(220)
+        lay.addWidget(self.port_combo)
         self._refresh_ports(preferred_port)
 
-        ttk.Button(bar, text="Rescan", command=lambda: self._refresh_ports(None)).pack(side="left")
-        self.connect_btn = ttk.Button(bar, text="Connect", command=self._toggle_connect)
-        self.connect_btn.pack(side="left", padx=6)
+        rescan_btn = QPushButton("Rescan")
+        rescan_btn.clicked.connect(lambda: self._refresh_ports(None))
+        lay.addWidget(rescan_btn)
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Send all", command=self.send_all,
-                   style="Accent.TButton").pack(side="left")
-        ttk.Button(bar, text="Reset to defaults", command=self.reset_defaults).pack(side="left", padx=6)
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self._toggle_connect)
+        lay.addWidget(self.connect_btn)
 
-        self.status_var = tk.StringVar(value="not connected")
-        ttk.Label(bar, textvariable=self.status_var, style="Status.TLabel").pack(side="right")
-        self.status_dot = ttk.Label(bar, text="\u25cf", style="Dot.TLabel")
-        self.status_dot.pack(side="right", padx=(10, 5))
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        lay.addWidget(sep)
 
-        self.theme_btn = ttk.Button(bar, command=self._toggle_theme, width=7)
-        self.theme_btn.pack(side="right", padx=(0, 12))
-        self._sync_theme_button()
+        send_all_btn = QPushButton("Send all")
+        send_all_btn.setObjectName("AccentButton")
+        send_all_btn.clicked.connect(self.send_all)
+        lay.addWidget(send_all_btn)
 
-    # --- preset bar ------------------------------------------------------
+        reset_btn = QPushButton("Reset to defaults")
+        reset_btn.clicked.connect(self.reset_defaults)
+        lay.addWidget(reset_btn)
 
-    def _build_preset_bar(self) -> None:
-        bar = ttk.Frame(self.root, padding=(8, 0, 8, 6))
-        bar.pack(fill="x")
+        lay.addStretch(1)
 
-        ttk.Button(bar, text="<", width=3, command=self._preset_prev).pack(side="left")
-        self.preset_num_var = tk.StringVar(value="000")
-        self.preset_spin = ttk.Spinbox(
-            bar,
-            from_=0,
-            to=presets.NUM_SLOTS - 1,
-            textvariable=self.preset_num_var,
-            width=4,
-            command=self._preset_number_committed,
+        self.status_dot = QLabel("●")
+        self.status_dot.setStyleSheet(f"color: {theme.PALETTES[self.mode]['off']}; font-size: 14px;")
+        lay.addWidget(self.status_dot)
+
+        self.status_label = QLabel("not connected")
+        self.status_label.setObjectName("MutedLabel")
+        lay.addWidget(self.status_label)
+
+        self.theme_btn = QPushButton("Light" if self.mode == "dark" else "Dark")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        lay.addWidget(self.theme_btn)
+
+        return bar
+
+    def _build_preset_bar(self) -> QWidget:
+        bar = QFrame()
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        prev_btn = QPushButton("<")
+        prev_btn.setFixedWidth(32)
+        prev_btn.clicked.connect(self._preset_prev)
+        lay.addWidget(prev_btn)
+
+        self.preset_spin = QSpinBox()
+        self.preset_spin.setRange(0, presets.NUM_SLOTS - 1)
+        self.preset_spin.setDisplayIntegerBase(10)
+        self.preset_spin.valueChanged.connect(self._preset_number_committed)
+        lay.addWidget(self.preset_spin)
+
+        self.preset_dirty_label = QLabel("")
+        self.preset_dirty_label.setFixedWidth(12)
+        lay.addWidget(self.preset_dirty_label)
+
+        self.preset_name_entry = QLineEdit("Init")
+        self.preset_name_entry.textChanged.connect(self._refresh_dirty)
+        lay.addWidget(self.preset_name_entry, 1)
+
+        next_btn = QPushButton(">")
+        next_btn.setFixedWidth(32)
+        next_btn.clicked.connect(self._preset_next)
+        lay.addWidget(next_btn)
+
+        for text, slot_fn in (
+            ("Load", self._preset_load),
+            ("Save", lambda: self._preset_save(None)),
+            ("Save as…", self._preset_save_as),
+            ("Init", self._preset_init),
+            ("Browse…", self._open_browser),
+        ):
+            btn = QPushButton(text)
+            btn.clicked.connect(slot_fn)
+            lay.addWidget(btn)
+
+        file_btn = QPushButton("File ▼")
+        menu = QMenu(file_btn)
+        menu.addAction("Export patch…", self._export_patch_file)
+        menu.addAction("Import patch…", self._import_patch_file)
+        menu.addSeparator()
+        menu.addAction("Export bank…", self._export_bank_file)
+        menu.addAction("Import bank…", self._import_bank_file)
+        file_btn.setMenu(menu)
+        lay.addWidget(file_btn)
+
+        return bar
+
+    def _build_log_pane(self) -> QWidget:
+        box = QGroupBox("Board output")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        self.log_text = QPlainTextEdit()
+        self.log_text.setObjectName("LogView")
+        self.log_text.setReadOnly(True)
+        lay.addWidget(self.log_text)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.log_text.clear)
+        btn_row.addWidget(clear_btn)
+        lay.addLayout(btn_row)
+
+        return box
+
+    def _scrollable(self) -> tuple[QScrollArea, QWidget, QVBoxLayout]:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+        area.setWidget(content)
+        return area, content, lay
+
+    def _build_tabs(self) -> None:
+        for group in params.GROUP_ORDER:
+            area, _, lay = self._scrollable()
+            self.tabs.addTab(area, group)
+
+            if group == params.GROUP_OSC:
+                self._build_osc_tab(lay)
+            elif group == params.GROUP_ENV:
+                self._build_env_tab(lay)
+            elif group == params.GROUP_CHARACTER:
+                for param in [p for p in params.PARAMS if p.group == group]:
+                    self._add_param_widget(lay, param)
+                self._add_character_jitter_sliders(lay)
+                lay.addStretch(1)
+            elif group == params.GROUP_CAL:
+                for block in [b for b in params.BLOCKS if b.group == group]:
+                    self._add_block_widget(lay, block)
+                for param in [p for p in params.PARAMS if p.group == group]:
+                    self._add_param_widget(lay, param)
+                self._add_manual_cal_indicator(lay)
+                self._wire_manual_cal_recall()
+                self._add_pio_pulse_slider(lay)
+                self._add_cal_diag_panel(
+                    lay, "Dev tables", params.CAL_DEBUG_COMMANDS,
+                    "Seed force-writes fake amp-comp + PW tables. Verify sweep measures duty errors.",
+                )
+                self._add_cal_diag_panel(
+                    lay, "Amp-comp calibration method",
+                    models.filter_debug_commands(params.AMP_CAL_METHOD_COMMANDS),
+                    "Search used to build amp-comp tables. Runtime-only.",
+                )
+                self._add_cal_backup_panel(lay)
+                lay.addStretch(1)
+            else:
+                for block in [b for b in params.BLOCKS if b.group == group]:
+                    self._add_block_widget(lay, block)
+                for param in [p for p in params.PARAMS if p.group == group]:
+                    self._add_param_widget(lay, param)
+                lay.addStretch(1)
+
+        # Diagnostics Tab
+        area, _, lay = self._scrollable()
+        self.tabs.addTab(area, params.GROUP_DIAG)
+        self._build_diag_tab(lay)
+
+    # --- Oscillators Tab ---
+
+    def _build_osc_tab(self, parent_layout: QVBoxLayout) -> None:
+        top_split = QHBoxLayout()
+
+        left_box = QGroupBox("Pitch & Sync")
+        left_lay = QVBoxLayout(left_box)
+        for pid in OSC_PITCH_PIDS + OSC_SYNC_PIDS:
+            if pid in PARAM_BY_PID:
+                self._add_param_widget(left_lay, PARAM_BY_PID[pid])
+        left_lay.addStretch(1)
+        top_split.addWidget(left_box, 1)
+
+        right_box = QGroupBox("Voice & Drift")
+        right_lay = QVBoxLayout(right_box)
+        for pid in OSC_VOICE_PIDS:
+            if pid in PARAM_BY_PID:
+                self._add_param_widget(right_lay, PARAM_BY_PID[pid])
+        right_lay.addStretch(1)
+        top_split.addWidget(right_box, 1)
+
+        parent_layout.addLayout(top_split)
+
+        # Levels
+        lvl_box = QGroupBox("Levels")
+        lvl_lay = QGridLayout(lvl_box)
+        col = 0
+        for pid in OSC_LEVEL_PIDS:
+            p = PARAM_BY_PID[pid]
+            if p.hidden:
+                continue
+            lbl = QLabel(p.label)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(p.lo, p.hi)
+            slider.setValue(p.default)
+            rd = QLabel(str(p.default))
+            rd.setObjectName("ReadoutLabel")
+
+            slider.valueChanged.connect(
+                lambda val, pid=p.pid, rd=rd: self._on_slider_changed(pid, val, rd)
+            )
+            lvl_lay.addWidget(lbl, 0, col)
+            lvl_lay.addWidget(slider, 1, col)
+            lvl_lay.addWidget(rd, 2, col, Qt.AlignmentFlag.AlignCenter)
+            self.param_widgets[p.pid] = slider
+            self._readouts[("p", p.pid)] = rd
+            col += 1
+        parent_layout.addWidget(lvl_box)
+
+        # Waveforms Matrix
+        wave_box = QGroupBox("Waveforms")
+        wave_lay = QGridLayout(wave_box)
+        for c, col_name in enumerate(OSC_WAVE_COLS, start=1):
+            wave_lay.addWidget(QLabel(col_name), 0, c, Qt.AlignmentFlag.AlignCenter)
+        for r, (row_name, pids) in enumerate(OSC_WAVE_MATRIX, start=1):
+            wave_lay.addWidget(QLabel(row_name), r, 0, Qt.AlignmentFlag.AlignRight)
+            for c, pid in enumerate(pids, start=1):
+                p = PARAM_BY_PID[pid]
+                if not p.hidden:
+                    chk = QCheckBox()
+                    chk.setChecked(bool(p.default))
+                    chk.toggled.connect(
+                        lambda checked, pid=p.pid: self._on_check_toggled(pid, checked)
+                    )
+                    wave_lay.addWidget(chk, r, c, Qt.AlignmentFlag.AlignCenter)
+                    self.param_widgets[p.pid] = chk
+        parent_layout.addWidget(wave_box)
+        parent_layout.addStretch(1)
+
+    # --- Envelopes Tab ---
+
+    def _build_env_tab(self, parent_layout: QVBoxLayout) -> None:
+        times_box = QGroupBox("ADSR Envelopes")
+        times_lay = QHBoxLayout(times_box)
+
+        for bkey in ENV_ADSR_BLOCKS:
+            block = self.blocks_by_key[bkey]
+            bbox = QGroupBox(block.label)
+            blay = QHBoxLayout(bbox)
+            self.block_widgets[bkey] = {}
+            for f in block.fields:
+                col = QVBoxLayout()
+                col.addWidget(QLabel(f.label), 0, Qt.AlignmentFlag.AlignCenter)
+                slider = QSlider(Qt.Orientation.Vertical)
+                slider.setRange(f.lo, f.hi)
+                slider.setValue(f.default)
+                slider.setMinimumHeight(140)
+                rd = QLabel(str(f.default))
+                rd.setObjectName("ReadoutLabel")
+
+                slider.valueChanged.connect(
+                    lambda val, bkey=bkey, fkey=f.key, rd=rd: self._on_block_slider_changed(bkey, fkey, val, rd)
+                )
+                col.addWidget(slider, 1, Qt.AlignmentFlag.AlignCenter)
+                col.addWidget(rd, 0, Qt.AlignmentFlag.AlignCenter)
+                blay.addLayout(col)
+                self.block_widgets[bkey][f.key] = slider
+                self._readouts[("b", bkey, f.key)] = rd
+            times_lay.addWidget(bbox)
+        parent_layout.addWidget(times_box)
+
+        # Curves
+        curves_box = QGroupBox("Curves & Routing")
+        curves_lay = QHBoxLayout(curves_box)
+        for col_name, a_pid, d_pid, r_pid in ENV_CURVE_COLUMNS:
+            col_box = QGroupBox(col_name)
+            clay = QVBoxLayout(col_box)
+            if a_pid is not None and d_pid is not None:
+                for pid, title in ((a_pid, "Attack"), (d_pid, "Decay")):
+                    clay.addWidget(QLabel(title))
+                    p = PARAM_BY_PID[pid]
+                    cb = QComboBox()
+                    for label, val in p.choices:
+                        cb.addItem(label, val)
+                    cb.setCurrentIndex(next(i for i, c in enumerate(p.choices) if c[1] == p.default))
+                    cb.currentIndexChanged.connect(
+                        lambda idx, pid=p.pid, cb=cb: self._on_combo_changed(pid, cb.itemData(idx))
+                    )
+                    clay.addWidget(cb)
+                    self.param_widgets[p.pid] = cb
+            if r_pid is not None:
+                rp = PARAM_BY_PID[r_pid]
+                chk = QCheckBox(rp.label)
+                chk.setChecked(bool(rp.default))
+                chk.toggled.connect(
+                    lambda checked, pid=rp.pid: self._on_check_toggled(pid, checked)
+                )
+                clay.addWidget(chk)
+                self.param_widgets[rp.pid] = chk
+            clay.addStretch(1)
+            curves_lay.addWidget(col_box)
+        parent_layout.addWidget(curves_box)
+
+        for p in params.PARAMS:
+            if p.group == params.GROUP_ENV and p.pid not in ENV_CURVE_RESTART_PIDS:
+                self._add_param_widget(parent_layout, p)
+        parent_layout.addStretch(1)
+
+    # --- Diagnostics Tab ---
+
+    def _build_diag_tab(self, parent_layout: QVBoxLayout) -> None:
+        grid = QGridLayout()
+        panel_specs = [
+            ("Diagnostics", models.filter_debug_commands(params.DEBUG_COMMANDS),
+             "RAM dumps, period probes, note retrig.", 0, 0),
+            ("Hot-path profiler", params.BENCH_COMMANDS,
+             "Needs RUNNING_AVERAGE in firmware.", 0, 1),
+            ("Amp-comp method / bench", params.AMP_COMP_COMMANDS,
+             "Speed/accuracy benchmarks.", 1, 0),
+            ("Pitch-interp bench", params.PITCH_INTERP_COMMANDS,
+             "Compares FLOAT / RATIO_Q16 / Q12.", 1, 1),
+            ("Clkdiv methods", params.CLKDIV_HP_COMMANDS,
+             "Speed & accuracy vs GOLD_REF.", 2, 0),
+        ]
+        if models.active().has_mainboard:
+            panel_specs.append(
+                ("Mainboard profiler", params.BENCH_MB_COMMANDS,
+                 "Forwards 45 and 42 to STM32 Mainboard over Serial2.", 2, 1)
+            )
+
+        for title, cmds, note, r, c in panel_specs:
+            box = QGroupBox(title)
+            lay = QVBoxLayout(box)
+            btn_grid = QGridLayout()
+            for i, (label, val) in enumerate(cmds):
+                btn = QPushButton(label)
+                btn.clicked.connect(lambda _, v=val, l=label: self._send_debug_cmd(v, l))
+                btn_grid.addWidget(btn, i // 2, i % 2)
+            lay.addLayout(btn_grid)
+            note_lbl = QLabel(note)
+            note_lbl.setObjectName("MutedLabel")
+            note_lbl.setWordWrap(True)
+            lay.addWidget(note_lbl)
+            grid.addWidget(box, r, c)
+
+        parent_layout.addLayout(grid)
+        parent_layout.addStretch(1)
+
+    # --- Generic Widget Builders ---
+
+    def _add_param_widget(self, parent_layout: QVBoxLayout, p: params.Param) -> None:
+        if p.hidden:
+            return
+        row = QHBoxLayout()
+        lbl = QLabel(f"{p.label} [{p.pid}]")
+        lbl.setMinimumWidth(220)
+        row.addWidget(lbl)
+
+        if p.pid == PID_MANUAL_CAL_STAGE:
+            self._add_manual_cal_stage_row(row)
+        elif p.kind == "slider":
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(p.lo, p.hi)
+            slider.setValue(p.default)
+            rd = QLabel(str(p.default))
+            rd.setObjectName("ReadoutLabel")
+            rd.setFixedWidth(50)
+            rd.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            slider.valueChanged.connect(
+                lambda val, pid=p.pid, rd=rd: self._on_slider_changed(pid, val, rd)
+            )
+            row.addWidget(slider, 1)
+            row.addWidget(rd)
+            self.param_widgets[p.pid] = slider
+            self._readouts[("p", p.pid)] = rd
+            if p.pid in CAL_KIND_PIDS:
+                self._cal_kind_rows[p.pid] = (lbl, slider)
+        elif p.kind == "combo":
+            cb = QComboBox()
+            for label, val in p.choices:
+                cb.addItem(label, val)
+            cb.setCurrentIndex(next((i for i, c in enumerate(p.choices) if c[1] == p.default), 0))
+            cb.currentIndexChanged.connect(
+                lambda idx, pid=p.pid, cb=cb: self._on_combo_changed(pid, cb.itemData(idx))
+            )
+            row.addWidget(cb, 1)
+            self.param_widgets[p.pid] = cb
+        elif p.kind == "check":
+            chk = QCheckBox()
+            chk.setChecked(bool(p.default))
+            chk.toggled.connect(
+                lambda checked, pid=p.pid: self._on_check_toggled(pid, checked)
+            )
+            row.addWidget(chk, 1)
+            self.param_widgets[p.pid] = chk
+        elif p.kind == "pulse":
+            if p.pid == PID_RUN_AUTOTUNE:
+                self._add_cal_run_buttons(row, p)
+            else:
+                btn = QPushButton("Send")
+                btn.clicked.connect(lambda _, pid=p.pid, pv=p.pulse_value, l=p.label: self._on_pulse_clicked(pid, pv, l))
+                row.addWidget(btn)
+                self._pulse_buttons[p.pid] = btn
+
+        parent_layout.addLayout(row)
+
+    def _add_block_widget(self, parent_layout: QVBoxLayout, block: params.Block) -> None:
+        box = QGroupBox(block.label)
+        lay = QVBoxLayout(box)
+        self.block_widgets[block.key] = {}
+        for f in block.fields:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f.label), 0)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(f.lo, f.hi)
+            slider.setValue(f.default)
+            rd = QLabel(str(f.default))
+            rd.setObjectName("ReadoutLabel")
+            rd.setFixedWidth(50)
+            rd.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            slider.valueChanged.connect(
+                lambda val, bkey=block.key, fkey=f.key, rd=rd: self._on_block_slider_changed(bkey, fkey, val, rd)
+            )
+            row.addWidget(slider, 1)
+            row.addWidget(rd)
+            lay.addLayout(row)
+            self.block_widgets[block.key][f.key] = slider
+            self._readouts[("b", block.key, f.key)] = rd
+        parent_layout.addWidget(box)
+
+    def _add_manual_cal_stage_row(self, row: QHBoxLayout) -> None:
+        osc_labels = [calstages.osc_label(o) for o in range(models.active().num_oscillators)]
+        self._cal_osc_combo = QComboBox()
+        self._cal_osc_combo.addItems(osc_labels)
+        self._cal_osc_combo.currentIndexChanged.connect(self._manual_cal_on_osc_picked)
+        row.addWidget(self._cal_osc_combo)
+
+        self._cal_sub_combo = QComboBox()
+        self._cal_sub_combo.currentIndexChanged.connect(self._manual_cal_on_substage_picked)
+        row.addWidget(self._cal_sub_combo)
+
+        self._cal_stage_readout = QLabel("")
+        self._cal_stage_readout.setObjectName("MutedLabel")
+        row.addWidget(self._cal_stage_readout, 1)
+
+        self._manual_cal_fill_substages(0, calstages.KIND_SAW)
+        self._manual_cal_update_stage_readout()
+
+    def _add_cal_run_buttons(self, row: QHBoxLayout, p: params.Param) -> None:
+        for text, val in params.CAL_SCOPE_BUTTONS:
+            btn = QPushButton(text)
+            btn.clicked.connect(lambda _, v=val, t=text: self._on_run_autotune(v, t))
+            row.addWidget(btn)
+            if val == params.CAL_SCOPE_FULL:
+                self._pulse_buttons[p.pid] = btn
+
+        stop_btn = QPushButton("Stop")
+        stop_btn.clicked.connect(lambda: self._send_autotune_pulse(0, "Stop"))
+        row.addWidget(stop_btn)
+
+        # Radios
+        for name, offset in params.CAL_PRECISION_CHOICES:
+            rb = QRadioButton(name)
+            if offset == 0:
+                rb.setChecked(True)
+            rb.toggled.connect(lambda checked, off=offset: self._on_precision_toggled(checked, off))
+            row.addWidget(rb)
+
+    def _add_character_jitter_sliders(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("Diagnostic Noise Jitters (PARAM_DEBUG_COMMAND 160)")
+        lay = QVBoxLayout(box)
+        for label_text, type_hi in params.CHARACTER_JITTERS:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label_text))
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(params.CHARACTER_JITTER_LO, params.CHARACTER_JITTER_HI)
+            slider.setValue(params.CHARACTER_JITTER_DEFAULT)
+            rd = QLabel(str(params.CHARACTER_JITTER_DEFAULT))
+            rd.setObjectName("ReadoutLabel")
+            rd.setFixedWidth(50)
+            slider.valueChanged.connect(
+                lambda val, hi=type_hi, rd=rd: self._on_char_jitter_changed(hi, val, rd)
+            )
+            row.addWidget(slider, 1)
+            row.addWidget(rd)
+            lay.addLayout(row)
+            self.character_jitter_sliders[type_hi] = slider
+            self._readouts[("char_jitter", type_hi)] = rd
+        parent_layout.addWidget(box)
+
+    def _add_pio_pulse_slider(self, parent_layout: QVBoxLayout) -> None:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("PIO pulse length (Y)"))
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(params.PIO_PULSE_LO, params.PIO_PULSE_HI)
+        slider.setValue(params.PIO_PULSE_DEFAULT)
+        rd = QLabel(str(params.PIO_PULSE_DEFAULT))
+        rd.setObjectName("ReadoutLabel")
+        rd.setFixedWidth(60)
+        slider.valueChanged.connect(
+            lambda val, rd=rd: self._on_pio_pulse_changed(val, rd)
         )
-        self.preset_spin.pack(side="left", padx=(6, 0))
-        self.preset_spin.bind("<Return>", lambda _e: self._preset_number_committed())
-        self.preset_spin.bind("<FocusOut>", lambda _e: self._preset_number_committed())
+        row.addWidget(slider, 1)
+        row.addWidget(rd)
+        self.pio_pulse_slider = slider
+        self._readouts[("pio_pulse",)] = rd
+        parent_layout.addLayout(row)
 
-        self.preset_dirty_var = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.preset_dirty_var, width=1).pack(side="left", padx=(8, 0))
+    def _add_cal_diag_panel(self, parent_layout: QVBoxLayout, title: str, cmds: tuple, note: str) -> None:
+        if not cmds:
+            return
+        box = QGroupBox(title)
+        lay = QVBoxLayout(box)
+        btn_row = QHBoxLayout()
+        for label, val in cmds:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _, v=val, l=label: self._send_debug_cmd(v, l))
+            btn_row.addWidget(btn)
+        lay.addLayout(btn_row)
+        note_lbl = QLabel(note)
+        note_lbl.setObjectName("MutedLabel")
+        note_lbl.setWordWrap(True)
+        lay.addWidget(note_lbl)
+        parent_layout.addWidget(box)
 
-        self.preset_name_var = tk.StringVar(value="Init")
-        self.preset_name_entry = ttk.Entry(bar, textvariable=self.preset_name_var, width=28)
-        self.preset_name_entry.pack(side="left", padx=(2, 6), fill="x", expand=True)
+    def _add_cal_backup_panel(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("Calibration Backup")
+        lay = QHBoxLayout(box)
+        dump_btn = QPushButton("Dump board → file…")
+        dump_btn.clicked.connect(self._cal_dump_to_file)
+        load_btn = QPushButton("Load file → board…")
+        load_btn.clicked.connect(self._cal_load_from_file)
+        lay.addWidget(dump_btn)
+        lay.addWidget(load_btn)
+        note = QLabel("Dump/restore 7 LittleFS cal tables as JSON.")
+        note.setObjectName("MutedLabel")
+        lay.addWidget(note, 1)
+        parent_layout.addWidget(box)
 
-        ttk.Button(bar, text=">", width=3, command=self._preset_next).pack(side="left")
-        ttk.Button(bar, text="Load", command=self._preset_load).pack(side="left", padx=(10, 0))
-        ttk.Button(bar, text="Save", command=self._preset_save).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="Save as…", command=self._preset_save_as).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="Init", command=self._preset_init).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="Browse…", command=self._open_browser).pack(side="left", padx=(10, 0))
+    def _add_manual_cal_indicator(self, parent_layout: QVBoxLayout) -> None:
+        self._manual_cal_indicator = QLabel("")
+        self._manual_cal_indicator.setObjectName("MutedLabel")
+        self._manual_cal_indicator.setWordWrap(True)
+        parent_layout.addWidget(self._manual_cal_indicator)
+        self._update_manual_cal_indicator()
 
-        file_btn = ttk.Menubutton(bar, text="File")
-        file_menu = tk.Menu(file_btn, tearoff=0)
-        file_menu.add_command(label="Export patch…", command=self._export_patch_file)
-        file_menu.add_command(label="Import patch…", command=self._import_patch_file)
-        file_menu.add_separator()
-        file_menu.add_command(label="Export bank…", command=self._export_bank_file)
-        file_menu.add_command(label="Import bank…", command=self._import_bank_file)
-        file_btn.configure(menu=file_menu)
-        file_btn.pack(side="left", padx=(6, 0))
+    # --- Interaction Handlers ---
+
+    def _on_slider_changed(self, pid: int, value: int, rd: QLabel) -> None:
+        rd.setText(str(value))
+        if self._preset_loading:
+            return
+        self.queue_param(pid, value)
+        self._manual_cal_on_param_changed(pid, value)
+
+    def _on_block_slider_changed(self, bkey: str, fkey: str, value: int, rd: QLabel) -> None:
+        rd.setText(str(value))
+        if self._preset_loading:
+            return
+        self.queue_block(bkey)
+
+    def _on_combo_changed(self, pid: int, value: int) -> None:
+        if self._preset_loading:
+            return
+        self.queue_param(pid, value)
+        if pid == PID_MANUAL_CAL_MODE and value != 0:
+            self._manual_cal_on_mode_enabled()
+
+    def _on_check_toggled(self, pid: int, checked: bool) -> None:
+        if self._preset_loading:
+            return
+        val = 1 if checked else 0
+        self.queue_param(pid, val)
+        if pid == PID_MANUAL_CAL_MODE and val != 0:
+            self._manual_cal_on_mode_enabled()
+
+    def _on_pulse_clicked(self, pid: int, val: int, label: str) -> None:
+        if not self._confirm_pulse(pid):
+            return
+        self.send_now(protocol.param16(pid, val))
+        self.log(f"[send] {label} (param {pid} = {val})\n")
+        if pid == PID_MANUAL_CAL_STORE:
+            self._manual_cal_on_stored()
+
+    def _on_precision_toggled(self, checked: bool, offset: int) -> None:
+        if checked:
+            self._cal_precision_offset = offset
+
+    def _on_run_autotune(self, value: int, text: str) -> None:
+        if not self._confirm_pulse(PID_RUN_AUTOTUNE):
+            return
+        wire = value + self._cal_precision_offset
+        self.send_now(protocol.param16(PID_RUN_AUTOTUNE, wire))
+        self.log(f"[send] Run {text} calibration (param {PID_RUN_AUTOTUNE} = {wire})\n")
+
+    def _send_autotune_pulse(self, wire: int, name: str) -> None:
+        self.send_now(protocol.param16(PID_RUN_AUTOTUNE, wire))
+        self.log(f"[send] {name} calibration (param {PID_RUN_AUTOTUNE} = {wire})\n")
+
+    def _send_debug_cmd(self, value: int, label: str) -> None:
+        self.send_now(protocol.param16(params.DEBUG_PARAM_ID, value))
+        self.log(f"[send] {label}\n")
+
+    def _on_char_jitter_changed(self, type_hi: int, value: int, rd: QLabel) -> None:
+        rd.setText(str(value))
+        if self._preset_loading:
+            return
+        self.queue_debug_u16((type_hi << 8) | value)
+
+    def _on_pio_pulse_changed(self, value: int, rd: QLabel) -> None:
+        rd.setText(str(value))
+        if self._preset_loading:
+            return
+        self.queue_debug_u16(value)
+
+    # --- Manual Calibration Logic ---
+
+    def _manual_cal_fill_substages(self, osc: int, keep_kind: int | None) -> None:
+        if self._cal_sub_combo is None:
+            return
+        kinds = calstages.kinds_for_osc(osc)
+        self._cal_sub_kinds = kinds
+        self._cal_sub_combo.blockSignals(True)
+        self._cal_sub_combo.clear()
+        for k in kinds:
+            self._cal_sub_combo.addItem(calstages.kind_label(k), k)
+        kind = keep_kind if keep_kind in kinds else kinds[0]
+        self._cal_sub_combo.setCurrentIndex(kinds.index(kind))
+        self._cal_sub_combo.blockSignals(False)
+
+    def _manual_cal_on_osc_picked(self) -> None:
+        if self._cal_osc_combo is None:
+            return
+        osc = self._cal_osc_combo.currentIndex()
+        kind = self._cal_sub_combo.currentData() if self._cal_sub_combo else calstages.KIND_SAW
+        self._manual_cal_fill_substages(osc, kind)
+        self._manual_cal_send_stage()
+
+    def _manual_cal_on_substage_picked(self) -> None:
+        self._manual_cal_send_stage()
+
+    def _manual_cal_send_stage(self) -> None:
+        if self._cal_osc_combo is None or self._cal_sub_combo is None:
+            return
+        osc = self._cal_osc_combo.currentIndex()
+        kind = self._cal_sub_combo.currentData()
+        stage = calstages.stage_for(osc, kind)
+        self._manual_cal_update_stage_readout()
+        if self._preset_loading or self._manual_cal_syncing:
+            return
+        self.queue_param(PID_MANUAL_CAL_STAGE, stage)
+        self._manual_cal_sync_controls()
+
+    def _manual_cal_update_stage_readout(self) -> None:
+        if self._cal_stage_readout is None or self._cal_osc_combo is None or self._cal_sub_combo is None:
+            return
+        osc = self._cal_osc_combo.currentIndex()
+        kind = self._cal_sub_combo.currentData()
+        stage = calstages.stage_for(osc, kind)
+        self._cal_stage_readout.setText(calstages.stage_text(stage))
+
+    def _manual_cal_apply_stage_enables(self) -> None:
+        if self._cal_osc_combo is None or self._cal_sub_combo is None:
+            return
+        osc = self._cal_osc_combo.currentIndex()
+        kind = self._cal_sub_combo.currentData()
+        for pid, (lbl, widget) in self._cal_kind_rows.items():
+            live = kind in CAL_KIND_PIDS.get(pid, ())
+            widget.setEnabled(live)
+            lbl.setStyleSheet("" if live else f"color: {theme.PALETTES[self.mode]['muted']};")
+
+    def _wire_manual_cal_recall(self) -> None:
+        self._manual_cal_apply_stage_enables()
+
+    def _manual_cal_on_mode_enabled(self) -> None:
+        if self._manual_cal_syncing or self._preset_loading:
+            return
+        if self._manual_cal_live is not None and self._manual_cal_all_dirty():
+            self._manual_cal_sync_controls()
+            return
+        self._manual_cal_refresh_from_board()
+
+    def _manual_cal_refresh_from_board(self) -> None:
+        if not self._mcu_ready():
+            return
+
+        def pwcenter_done(ok, payload):
+            if ok:
+                try:
+                    self._pwcenter_live = list(fileformats.decode_cal_table("PWCenter", payload))
+                    self._pwcenter_baseline = list(self._pwcenter_live)
+                    self._pwcenter_dirty.clear()
+                except ValueError as e:
+                    self.log(f"[mcu] PW center recall err: {e}\n")
+            self._manual_cal_sync_controls()
+            self._update_manual_cal_indicator()
+
+        def dutytrim_done(ok, payload):
+            if ok:
+                try:
+                    self._dutytrim_live = list(fileformats.decode_cal_table("AmpCompDutyOffset", payload))
+                    self._dutytrim_baseline = list(self._dutytrim_live)
+                    self._dutytrim_dirty.clear()
+                except ValueError as e:
+                    self.log(f"[mcu] duty trim recall err: {e}\n")
+            self.mcu.dump_cal_table("PWCenter", pwcenter_done)
+
+        def amp440_done(ok, payload):
+            if ok:
+                try:
+                    self._amp440_live = list(fileformats.decode_cal_table("AmpComp440", payload))
+                    self._amp440_baseline = list(self._amp440_live)
+                    self._amp440_dirty.clear()
+                except ValueError as e:
+                    self.log(f"[mcu] amp comp 440 err: {e}\n")
+            self.mcu.dump_cal_table("AmpCompDutyOffset", dutytrim_done)
+
+        def manual_done(ok, payload):
+            if ok:
+                try:
+                    self._manual_cal_live = list(fileformats.decode_cal_table("ManualOffset", payload))
+                    self._manual_cal_baseline = list(self._manual_cal_live)
+                    self._manual_cal_dirty.clear()
+                except ValueError as e:
+                    self.log(f"[mcu] manual offset err: {e}\n")
+            self.mcu.dump_cal_table("AmpComp440", amp440_done)
+
+        self.mcu.dump_cal_table("ManualOffset", manual_done)
+
+    def _manual_cal_sync_controls(self) -> None:
+        if self._cal_osc_combo is None:
+            return
+        osc = self._cal_osc_combo.currentIndex()
+        self._manual_cal_syncing = True
+        try:
+            if self._manual_cal_live and osc < len(self._manual_cal_live):
+                self._set_widget_value(PID_MANUAL_CAL_OFFSET, self._manual_cal_live[osc])
+            if self._amp440_live and osc < len(self._amp440_live):
+                stored = self._amp440_live[osc]
+                p = PARAM_BY_PID[PID_AMP_COMP_440]
+                if p.lo <= stored <= p.hi:
+                    self._set_widget_value(PID_AMP_COMP_440, stored)
+                else:
+                    rd = self._readouts.get(("p", PID_AMP_COMP_440))
+                    if rd:
+                        rd.setText(str(stored))
+            if self._dutytrim_live and osc < len(self._dutytrim_live):
+                self._set_widget_value(PID_AMP_COMP_DUTY_OFFSET, self._dutytrim_live[osc])
+            ch = calstages.pw_channel(osc)
+            if self._pwcenter_live and ch < len(self._pwcenter_live) and PID_CAL_PW_CENTER in self.param_widgets:
+                self._set_widget_value(PID_CAL_PW_CENTER, self._pwcenter_live[ch])
+        finally:
+            self._manual_cal_syncing = False
+        self._manual_cal_apply_stage_enables()
+
+    def _manual_cal_on_param_changed(self, pid: int, value: int) -> None:
+        if self._manual_cal_syncing or self._cal_osc_combo is None:
+            return
+        osc = self._cal_osc_combo.currentIndex()
+        if pid == PID_MANUAL_CAL_OFFSET and self._manual_cal_live:
+            self._track_edit(self._manual_cal_live, self._manual_cal_baseline, self._manual_cal_dirty, osc, value)
+        elif pid == PID_AMP_COMP_440 and self._amp440_live:
+            self._track_edit(self._amp440_live, self._amp440_baseline, self._amp440_dirty, osc, value)
+        elif pid == PID_AMP_COMP_DUTY_OFFSET and self._dutytrim_live:
+            self._track_edit(self._dutytrim_live, self._dutytrim_baseline, self._dutytrim_dirty, osc, value)
+        elif pid == PID_CAL_PW_CENTER and self._pwcenter_live:
+            self._track_edit(self._pwcenter_live, self._pwcenter_baseline, self._pwcenter_dirty, calstages.pw_channel(osc), value)
+
+    def _track_edit(self, live: list[int], baseline: list[int] | None, dirty: set[int], idx: int, val: int) -> None:
+        if idx >= len(live):
+            return
+        live[idx] = val
+        stored = baseline[idx] if baseline and idx < len(baseline) else 0
+        if val != stored:
+            dirty.add(idx)
+        else:
+            dirty.discard(idx)
+        self._update_manual_cal_indicator()
+
+    def _manual_cal_all_dirty(self) -> bool:
+        return bool(self._manual_cal_dirty or self._amp440_dirty or self._dutytrim_dirty or self._pwcenter_dirty)
+
+    def _update_manual_cal_indicator(self) -> None:
+        if self._manual_cal_indicator is None:
+            return
+        if self._manual_cal_live is None:
+            self._manual_cal_indicator.setText(
+                "Manual cal values: not read from board yet — enable Manual cal mode to recall."
+            )
+        elif self._manual_cal_all_dirty():
+            names = [f"OSC {calstages.osc_label(o)}" for o in sorted(self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty)]
+            names += [f"PW ch {c}" for c in sorted(self._pwcenter_dirty)]
+            self._manual_cal_indicator.setText(
+                f"Manual cal values: unsaved changes for {', '.join(names)} — press Store before autotuning."
+            )
+        else:
+            self._manual_cal_indicator.setText("Manual cal values: matches what is stored on the board.")
+
+    def _manual_cal_on_stored(self) -> None:
+        if self._manual_cal_live:
+            self._manual_cal_baseline = list(self._manual_cal_live)
+        if self._amp440_live:
+            self._amp440_baseline = list(self._amp440_live)
+        if self._dutytrim_live:
+            self._dutytrim_baseline = list(self._dutytrim_live)
+        if self._pwcenter_live:
+            self._pwcenter_baseline = list(self._pwcenter_live)
+        self._manual_cal_dirty.clear()
+        self._amp440_dirty.clear()
+        self._dutytrim_dirty.clear()
+        self._pwcenter_dirty.clear()
+        self._update_manual_cal_indicator()
+
+    def _confirm_pulse(self, pid: int) -> bool:
+        if pid != PID_RUN_AUTOTUNE or not self._manual_cal_all_dirty():
+            return True
+        res = QMessageBox.warning(
+            self,
+            "Unsaved Manual Calibration Values",
+            "You have unsaved manual calibration values. Auto calibration will reload LittleFS and discard them.",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+        )
+        if res == QMessageBox.StandardButton.Cancel:
+            return False
+        if res == QMessageBox.StandardButton.Save:
+            store = PARAM_BY_PID[PID_MANUAL_CAL_STORE]
+            self.send_now(protocol.param16(PID_MANUAL_CAL_STORE, store.pulse_value))
+            self._manual_cal_on_stored()
+        return True
+
+    # --- Preset Management ---
 
     def _init_presets(self) -> None:
         self.bank = presets.load_bank()
-        for var in self.param_vars.values():
-            var.trace_add("write", lambda *_a: self._refresh_dirty())
-        for fields in self.block_vars.values():
-            for var in fields.values():
-                var.trace_add("write", lambda *_a: self._refresh_dirty())
         self._preset_recall(int(self.bank["current"]), send=False, persist_current=False)
 
-    def _preset_slot_index(self) -> int:
-        try:
-            n = int(str(self.preset_num_var.get()).strip())
-        except ValueError:
-            n = int(self.bank.get("current", 0))
-        return max(0, min(presets.NUM_SLOTS - 1, n))
-
-    def _set_preset_number(self, index: int) -> None:
-        self.preset_num_var.set(f"{index:03d}")
-
     def _current_ui_slot(self, name: str | None = None) -> dict:
-        slot = presets.capture(self.param_vars, self.block_vars, self._param_value)
-        if name is None:
-            name = self.preset_name_var.get().strip() or "Untitled"
-        slot["name"] = name[:48]
+        def get_val(p: params.Param) -> int:
+            w = self.param_widgets.get(p.pid)
+            if isinstance(w, QSlider):
+                return w.value()
+            if isinstance(w, QComboBox):
+                return w.currentData()
+            if isinstance(w, QCheckBox):
+                return 1 if w.isChecked() else 0
+            return p.default
+
+        slot = presets.defaults_slot(name or self.preset_name_entry.text().strip() or "Untitled")
+        for p in presets.patch_params():
+            slot["params"][str(p.pid)] = get_val(p)
+        for b in presets.patch_blocks():
+            for f in b.fields:
+                w = self.block_widgets.get(b.key, {}).get(f.key)
+                if isinstance(w, QSlider):
+                    slot["blocks"][b.key][f.key] = w.value()
         return slot
 
     def _refresh_dirty(self) -> None:
         if self._preset_loading:
             return
         fp = presets.slot_fingerprint(self._current_ui_slot())
-        self.preset_dirty_var.set("*" if fp != self._clean_fp else "")
-
-    def _push_if_connected(self) -> None:
-        if self.link.is_open:
-            self.send_all()
-
-    def _sync_readouts(self) -> None:
-        """Refresh Scale numeric labels from live vars (command often skipped on var.set)."""
-        for key, rd in self._readouts.items():
-            if key[0] == "p":
-                var = self.param_vars.get(key[1])
-            elif key[0] == "pio_pulse":
-                var = self.pio_pulse_var
-            elif key[0] == "char_jitter":
-                var = self.character_jitter_vars.get(key[1])
-            else:
-                var = self.block_vars.get(key[1], {}).get(key[2])
-            if var is None:
-                continue
-            rd.config(text=str(ivar(var)))
+        self.preset_dirty_label.setText("*" if fp != self._clean_fp else "")
 
     def _preset_recall(self, index: int, *, send: bool, persist_current: bool) -> None:
         index = max(0, min(presets.NUM_SLOTS - 1, index))
@@ -430,225 +1126,171 @@ class App:
         empty = presets.slot_is_empty(slot)
         self._preset_loading = True
         try:
-            presets.apply(self.param_vars, self.block_vars, None if empty else slot)
-            if empty:
-                self.preset_name_var.set("Init")
-                self._clean_fp = presets.slot_fingerprint(presets.defaults_slot())
-            else:
-                self.preset_name_var.set(slot["name"])
-                self._clean_fp = presets.slot_fingerprint(slot)
-            self._set_preset_number(index)
+            self._apply_slot_dict(None if empty else slot)
+            name = "Init" if empty else slot["name"]
+            self.preset_name_entry.setText(name)
+            self._clean_fp = presets.slot_fingerprint(presets.defaults_slot() if empty else slot)
+            self.preset_spin.blockSignals(True)
+            self.preset_spin.setValue(index)
+            self.preset_spin.blockSignals(False)
             self.bank["current"] = index
         finally:
             self._preset_loading = False
-        self._sync_readouts()
-        self.preset_dirty_var.set("")
+
+        self._refresh_dirty()
         if persist_current:
             presets.save_bank(self.bank)
-        if empty:
-            self.log(f"[preset] {index:03d} empty -- Init defaults loaded\n")
-        else:
-            self.log(f"[preset] loaded {index:03d} {slot['name']}\n")
-        if send:
-            self._push_if_connected()
+        if send and self.link.is_open:
+            self.send_all()
+
+    def _apply_slot_dict(self, slot: dict | None) -> None:
+        data = presets.defaults_slot() if presets.slot_is_empty(slot) else slot  # type: ignore[arg-type]
+        for p in presets.patch_params():
+            val = int(data["params"].get(str(p.pid), p.default))
+            self._set_widget_value(p.pid, val)
+        for b in presets.patch_blocks():
+            for f in b.fields:
+                val = int(data["blocks"].get(b.key, {}).get(f.key, f.default))
+                w = self.block_widgets.get(b.key, {}).get(f.key)
+                if isinstance(w, QSlider):
+                    w.setValue(val)
+                    rd = self._readouts.get(("b", b.key, f.key))
+                    if rd:
+                        rd.setText(str(val))
+
+    def _set_widget_value(self, pid: int, val: int) -> None:
+        w = self.param_widgets.get(pid)
+        if isinstance(w, QSlider):
+            w.setValue(val)
+            rd = self._readouts.get(("p", pid))
+            if rd:
+                rd.setText(str(val))
+        elif isinstance(w, QComboBox):
+            idx = w.findData(val)
+            if idx != -1:
+                w.setCurrentIndex(idx)
+        elif isinstance(w, QCheckBox):
+            w.setChecked(bool(val))
 
     def _preset_number_committed(self) -> None:
-        index = self._preset_slot_index()
-        if index == int(self.bank.get("current", -1)):
-            self._set_preset_number(index)
+        idx = self.preset_spin.value()
+        if idx == int(self.bank.get("current", -1)):
             return
-        self._preset_recall(index, send=True, persist_current=True)
+        self._preset_recall(idx, send=True, persist_current=True)
 
     def _preset_prev(self) -> None:
-        index = (self._preset_slot_index() - 1) % presets.NUM_SLOTS
-        self._preset_recall(index, send=True, persist_current=True)
+        idx = (self.preset_spin.value() - 1) % presets.NUM_SLOTS
+        self._preset_recall(idx, send=True, persist_current=True)
 
     def _preset_next(self) -> None:
-        index = (self._preset_slot_index() + 1) % presets.NUM_SLOTS
-        self._preset_recall(index, send=True, persist_current=True)
+        idx = (self.preset_spin.value() + 1) % presets.NUM_SLOTS
+        self._preset_recall(idx, send=True, persist_current=True)
 
     def _preset_load(self) -> None:
-        self._preset_recall(self._preset_slot_index(), send=True, persist_current=True)
+        self._preset_recall(self.preset_spin.value(), send=True, persist_current=True)
 
     def _preset_save(self, index: int | None = None) -> None:
         if index is None:
-            index = self._preset_slot_index()
-        typed = self.preset_name_var.get().strip()
-        existing = self.bank["slots"][index]
-        if typed:
-            name = typed[:48]
-        elif not presets.slot_is_empty(existing):
-            name = existing["name"]
-        else:
-            name = "Untitled"
+            index = self.preset_spin.value()
+        name = self.preset_name_entry.text().strip() or "Untitled"
         slot = self._current_ui_slot(name)
         self.bank["slots"][index] = slot
         self.bank["current"] = index
         presets.save_bank(self.bank)
-        self.preset_name_var.set(name)
-        self._set_preset_number(index)
         self._clean_fp = presets.slot_fingerprint(slot)
-        self.preset_dirty_var.set("")
+        self._refresh_dirty()
         self.log(f"[preset] saved {index:03d} {name}\n")
-        self._browser_refresh()
+        if self._browser and self._browser.isVisible():
+            self._browser.refresh()
 
     def _preset_save_as(self) -> None:
-        current_index = self._preset_slot_index()
-        dest = simpledialog.askinteger(
-            "Save as…", "Slot (0–255):",
-            initialvalue=current_index, minvalue=0, maxvalue=presets.NUM_SLOTS - 1,
-            parent=self.root,
-        )
-        if dest is None:
+        idx, ok = QInputDialog.getInt(self, "Save as…", "Slot (0–255):", self.preset_spin.value(), 0, presets.NUM_SLOTS - 1)
+        if not ok:
             return
-        existing = self.bank["slots"][dest]
-        if dest != current_index and not presets.slot_is_empty(existing):
-            if not messagebox.askyesno(
-                "Save as…",
-                f"Slot {dest:03d} already has “{existing['name']}”. Overwrite?",
-                parent=self.root,
-            ):
-                return
-        current_name = self.preset_name_var.get().strip() or "Untitled"
-        name = simpledialog.askstring(
-            "Save as…", "Preset name:", initialvalue=current_name, parent=self.root
-        )
-        if name is None:
+        name, ok = QInputDialog.getText(self, "Save as…", "Preset name:", text=self.preset_name_entry.text())
+        if not ok:
             return
-        name = name.strip()[:48] or "Untitled"
-        self.preset_name_var.set(name)
-        self._preset_save(dest)
+        self.preset_name_entry.setText(name.strip() or "Untitled")
+        self.preset_spin.setValue(idx)
+        self._preset_save(idx)
 
     def _preset_init(self) -> None:
         self._preset_loading = True
         try:
-            presets.apply(self.param_vars, self.block_vars, None)
-            self.preset_name_var.set("Init")
+            self._apply_slot_dict(None)
+            self.preset_name_entry.setText("Init")
         finally:
             self._preset_loading = False
-        self._sync_readouts()
         self._refresh_dirty()
-        self.log("[preset] Init defaults in UI -- Save to store in this slot\n")
-        self._push_if_connected()
+        self.log("[preset] Init defaults in UI -- Save to store in slot\n")
+        if self.link.is_open:
+            self.send_all()
 
-    # --- preset browser / files -------------------------------------------
+    # --- File & Browser Dialogs ---
 
     def _open_browser(self) -> None:
-        if self._browser is not None and self._browser.winfo_exists():
-            self._browser.lift()
-            self._browser.focus_set()
-            return
-        self._browser = PresetBrowser(self)
-
-    def _browser_refresh(self) -> None:
-        if self._browser is not None and self._browser.winfo_exists():
-            self._browser.refresh()
-
-    def apply_slot_to_ui(self, slot: dict, *, send: bool) -> None:
-        """Load a slot dict (from a file or the MCU) into the live controls."""
-        self._preset_loading = True
-        try:
-            presets.apply(self.param_vars, self.block_vars, slot)
-            self.preset_name_var.set(slot["name"])
-        finally:
-            self._preset_loading = False
-        self._sync_readouts()
-        self._refresh_dirty()
-        if send:
-            self._push_if_connected()
+        if self._browser is None:
+            self._browser = PresetBrowser(self)
+        self._browser.show()
+        self._browser.raise_()
+        self._browser.activateWindow()
 
     def _export_patch_file(self) -> None:
         slot = self._current_ui_slot()
-        path = filedialog.asksaveasfilename(
-            parent=self.root, title="Export patch", defaultextension=".json",
-            initialfile=f"{slot['name'] or 'patch'}.json", filetypes=JSON_FILETYPES)
-        if not path:
-            return
-        try:
+        path, _ = QFileDialog.getSaveFileName(self, "Export Patch", f"{slot['name']}.json", "JSON (*.json)")
+        if path:
             fileformats.save_patch_file(path, slot)
-        except OSError as exc:
-            self.log(f"[ui] patch export failed: {exc}\n")
-            return
-        self.log(f"[ui] exported patch \"{slot['name']}\" to {path}\n")
+            self.log(f"[ui] exported patch to {path}\n")
 
     def _import_patch_file(self) -> None:
-        path = filedialog.askopenfilename(
-            parent=self.root, title="Import patch", filetypes=JSON_FILETYPES)
-        if not path:
-            return
-        try:
+        path, _ = QFileDialog.getOpenFileName(self, "Import Patch", "", "JSON (*.json)")
+        if path:
             slot = fileformats.load_patch_file(path)
-        except (OSError, ValueError) as exc:
-            self.log(f"[ui] patch import failed: {exc}\n")
-            return
-        self.apply_slot_to_ui(slot, send=True)
-        self.log(f"[ui] imported patch \"{slot['name']}\" -- Save to keep it in a slot\n")
+            self._preset_loading = True
+            try:
+                self._apply_slot_dict(slot)
+                self.preset_name_entry.setText(slot["name"])
+            finally:
+                self._preset_loading = False
+            self._refresh_dirty()
+            if self.link.is_open:
+                self.send_all()
+            self.log(f"[ui] imported patch from {path}\n")
 
     def _export_bank_file(self) -> None:
-        path = filedialog.asksaveasfilename(
-            parent=self.root, title="Export bank", defaultextension=".json",
-            initialfile="dco_bank.json", filetypes=JSON_FILETYPES)
-        if not path:
-            return
-        try:
+        path, _ = QFileDialog.getSaveFileName(self, "Export Bank", "dco_bank.json", "JSON (*.json)")
+        if path:
             fileformats.save_bank_file(path, self.bank)
-        except OSError as exc:
-            self.log(f"[ui] bank export failed: {exc}\n")
-            return
-        self.log(f"[ui] exported bank to {path}\n")
+            self.log(f"[ui] exported bank to {path}\n")
 
     def _import_bank_file(self) -> None:
-        path = filedialog.askopenfilename(
-            parent=self.root, title="Import bank", filetypes=JSON_FILETYPES)
-        if not path:
-            return
-        try:
-            bank = fileformats.load_bank_file(path)
-        except (OSError, ValueError) as exc:
-            self.log(f"[ui] bank import failed: {exc}\n")
-            return
-        if not messagebox.askyesno(
-            "Import bank",
-            "Replace the whole local bank with this file? The current bank.json "
-            "is overwritten.",
-            parent=self.root,
-        ):
-            return
-        self.bank = bank
-        presets.save_bank(self.bank)
-        self._preset_recall(int(self.bank["current"]), send=True, persist_current=False)
-        self._browser_refresh()
-        self.log(f"[ui] imported bank from {path}\n")
-
-    # --- MCU sync / calibration backup -------------------------------------
-
-    def _mcu_ready(self) -> bool:
-        if not self.link.is_open:
-            self.log("[mcu] not connected\n")
-            return False
-        if self.mcu.busy:
-            self.log("[mcu] transfer in progress -- wait for it to finish\n")
-            return False
-        return True
+        path, _ = QFileDialog.getOpenFileName(self, "Import Bank", "", "JSON (*.json)")
+        if path:
+            self.bank = fileformats.load_bank_file(path)
+            presets.save_bank(self.bank)
+            self._preset_recall(int(self.bank["current"]), send=True, persist_current=False)
+            if self._browser:
+                self._browser.refresh()
+            self.log(f"[ui] imported bank from {path}\n")
 
     def _cal_dump_to_file(self) -> None:
-        """Pull every calibration table off the board, then ask where to save."""
         if not self._mcu_ready():
             return
         names = list(mcu_link.cal_tables())
         results: dict[str, bytes] = {}
 
-        def step(k: int) -> None:
+        def step(k: int):
             if k >= len(names):
-                self._cal_dump_finish(results, names)
+                path, _ = QFileDialog.getSaveFileName(self, "Save Calibration Dump", "dco_calibration.json", "JSON (*.json)")
+                if path:
+                    fileformats.save_cal_file(path, results)
+                    self.log(f"[mcu] saved cal dump to {path}\n")
                 return
             name = names[k]
 
-            def done(ok, payload, name=name, k=k):
+            def done(ok, payload):
                 if ok:
                     results[name] = payload
-                else:
-                    self.log(f"[mcu] cal dump {name}: {payload}\n")
                 step(k + 1)
 
             self.mcu.dump_cal_table(name, done)
@@ -656,2053 +1298,333 @@ class App:
         self.log("[mcu] dumping calibration tables...\n")
         step(0)
 
-    def _cal_dump_finish(self, results: dict[str, bytes], names: list[str]) -> None:
-        if not results:
-            self.log("[mcu] calibration dump failed -- nothing to save\n")
-            return
-        missing = [n for n in names if n not in results]
-        if missing:
-            self.log(f"[mcu] missing tables (saved anyway): {', '.join(missing)}\n")
-        path = filedialog.asksaveasfilename(
-            parent=self.root, title="Save calibration dump", defaultextension=".json",
-            initialfile="dco_calibration.json", filetypes=JSON_FILETYPES)
-        if not path:
-            return
-        try:
-            fileformats.save_cal_file(path, results)
-        except OSError as exc:
-            self.log(f"[mcu] calibration save failed: {exc}\n")
-            return
-        self.log(f"[mcu] calibration ({len(results)} tables) saved to {path}\n")
-
     def _cal_load_from_file(self) -> None:
-        """Push calibration tables from a <model>-cal file into the board's LittleFS."""
         if not self._mcu_ready():
             return
-        path = filedialog.askopenfilename(
-            parent=self.root, title="Load calibration file", filetypes=JSON_FILETYPES)
+        path, _ = QFileDialog.getOpenFileName(self, "Load Calibration File", "", "JSON (*.json)")
         if not path:
             return
-        try:
-            tables = fileformats.load_cal_file(path)
-        except (OSError, ValueError) as exc:
-            self.log(f"[mcu] calibration file rejected: {exc}\n")
-            return
-        if not tables:
-            self.log("[mcu] calibration file has no tables\n")
-            return
-        if not messagebox.askyesno(
-            "Load calibration",
-            f"Overwrite the board's calibration with {len(tables)} table(s) from this "
-            "file? This rewrites LittleFS and reloads the tables live.",
-            parent=self.root,
-        ):
-            return
+        tables = fileformats.load_cal_file(path)
         names = list(tables)
-        state = {"fail": 0}
 
-        def step(k: int) -> None:
+        def step(k: int):
             if k >= len(names):
-                ok_n = len(names) - state["fail"]
-                self.log(f"[mcu] calibration load done: {ok_n} ok, {state['fail']} failed\n")
+                self.log(f"[mcu] calibration load finished\n")
                 return
             name = names[k]
-
-            def done(ok, payload, name=name, k=k):
-                if not ok:
-                    state["fail"] += 1
-                    self.log(f"[mcu] cal load {name}: {payload}\n")
-                step(k + 1)
-
-            self.mcu.push_cal_table(name, tables[name], done)
+            self.mcu.push_cal_table(name, tables[name], lambda ok, _: step(k + 1))
 
         step(0)
 
-    def _toggle_theme(self) -> None:
-        self.mode = "light" if self.mode == "dark" else "dark"
-        # ttk resolves styles at draw time, so this restyles the live widget tree in place.
-        theme.apply(self.root, self.mode)
-        self._style_log_tags()
-        self._sync_theme_button()
-        self._set_status_dot(self.link.is_open)
+    # --- Connection & IO ---
 
-    def _sync_theme_button(self) -> None:
-        self.theme_btn.config(text="Light" if self.mode == "dark" else "Dark")
-
-    def _set_status_dot(self, connected: bool) -> None:
-        self.status_dot.config(style="DotOn.TLabel" if connected else "Dot.TLabel")
-        self.dot_on = connected
+    def _mcu_ready(self) -> bool:
+        if not self.link.is_open:
+            self.log("[mcu] not connected\n")
+            return False
+        if self.mcu.busy:
+            self.log("[mcu] transfer in progress\n")
+            return False
+        return True
 
     def _refresh_ports(self, preferred: str | None) -> None:
-        values = [f"{p.device}  ({p.description})" for p in protocol.find_dco_ports()]
+        self.port_combo.clear()
+        ports = protocol.find_dco_ports()
+        for p in ports:
+            self.port_combo.addItem(f"{p.device} ({p.description})", p.device)
         if preferred:
-            values.insert(0, preferred)
-        self.port_combo["values"] = values
-        if values:
-            self.port_combo.current(0)
-        else:
-            self.port_var.set("")
-
-    def _selected_device(self) -> str:
-        raw = self.port_var.get().strip()
-        return raw.split()[0] if raw else ""
+            idx = self.port_combo.findData(preferred)
+            if idx != -1:
+                self.port_combo.setCurrentIndex(idx)
 
     def _toggle_connect(self) -> None:
         if self.link.is_open:
             self.mcu.cancel_all()
-            self._mcu_linebuf = ""
             self.link.close()
-            self.connect_btn.config(text="Connect")
-            self.status_var.set("not connected")
-            self._set_status_dot(False)
+            self.connect_btn.setText("Connect")
+            self.status_label.setText("not connected")
+            self.status_dot.setStyleSheet(f"color: {theme.PALETTES[self.mode]['off']};")
             self.log("[link] disconnected\n")
             return
-        device = self._selected_device()
+
+        device = self.port_combo.currentData()
         if not device:
             self.log("[link] no serial port selected\n")
             return
         try:
             self.link.open(device)
-        except (OSError, ValueError) as exc:
-            self.log(f"[link] could not open {device}: {exc}\n")
+        except (OSError, ValueError) as e:
+            self.log(f"[link] open failed: {e}\n")
             return
-        self.connect_btn.config(text="Disconnect")
-        self.status_var.set(f"connected to {device}")
-        self._set_status_dot(True)
-        self.log(f"[link] connected to {device} -- pushing UI state\n")
-        self.log(f"[link] framing={'COBS' if protocol.use_cobs else 'RAW'} "
-                 f"model={models.active().key}\n")
-        n = self.send_all()
-        self.log(f"[link] pushed UI state ({n} frames)\n")
-
-    # --- tabs ------------------------------------------------------------
-
-    def _shrink_log_pane(self) -> None:
-        """Park the Board output sash near the bottom so tabs get most of the window."""
-        height = self.paned.winfo_height()
-        if height <= 1:
-            self.root.after(50, self._shrink_log_pane)
-            return
-        # Leave a short log strip; the sash can be dragged up for long dumps.
-        self.paned.sashpos(0, max(200, height - 140))
-
-    def _build_tabs(self) -> None:
-        notebook = ttk.Notebook(self.paned)
-        self.notebook = notebook
-        self.paned.add(notebook, weight=5)
-        self._tab_canvases = []
-
-        for group in params.GROUP_ORDER:
-            page = ttk.Frame(notebook, padding=8)
-            notebook.add(page, text=group)
-            inner = self._scrollable(page)
-            if group == params.GROUP_OSC:
-                self._build_osc_tab(inner)
-            elif group == params.GROUP_ENV:
-                self._build_env_tab(inner)
-            elif group == params.GROUP_CHARACTER:
-                row = 0
-                for param in [p for p in params.PARAMS if p.group == group]:
-                    row = self._add_param(inner, param, row)
-                row = self._add_character_jitter_sliders(inner, row)
-                inner.columnconfigure(1, weight=1)
-            elif group == params.GROUP_CAL:
-                row = 0
-                for block in [b for b in params.BLOCKS if b.group == group]:
-                    row = self._add_block(inner, block, row)
-                for param in [p for p in params.PARAMS if p.group == group]:
-                    row = self._add_param(inner, param, row)
-                row = self._add_manual_cal_indicator(inner, row)
-                self._wire_manual_cal_recall()
-                row = self._add_pio_pulse_slider(inner, row)
-                row = self._add_cal_diag_panel(
-                    inner, row, "Dev tables", params.CAL_DEBUG_COMMANDS,
-                    "Seed force-writes fake amp-comp + PW tables (development "
-                    "placeholder). Verify sweep replays the stored tables through "
-                    "the runtime lookup and prints [CAL_VERIFY] duty errors.",
-                )
-                row = self._add_cal_diag_panel(
-                    inner, row, "Amp-comp calibration method",
-                    models.filter_debug_commands(params.AMP_CAL_METHOD_COMMANDS),
-                    "Search used to build the amp-comp tables. Runtime-only (boot default "
-                    "AUTOTUNE_AMP_METHOD_DEFAULT); FREQ_TRACE needs the stored 440 Hz anchors.",
-                )
-                row = self._add_cal_diag_panel(
-                    inner, row, "Frequency search convergence",
-                    models.filter_debug_commands(params.FREQ_SEARCH_MODE_COMMANDS),
-                    "How the frequency search closes in once it brackets the answer. "
-                    "Runtime-only (boot default INTERP); compare probes= and elapsed= "
-                    "on the [CAL_REPORT] footer at the same dutyErr.",
-                )
-                row = self._add_cal_diag_panel(
-                    inner, row, "Amp-comp-0 endpoint (lowest frequency)",
-                    models.filter_debug_commands(params.AMP0_MODE_COMMANDS),
-                    "Pair 0 of the amp-comp table. MEASURE hunts for it live at amp "
-                    "comp 0; CALC skips the hunt and stores the least-squares fit "
-                    "through the lowest measured rungs. Runtime-only (boot default "
-                    "MEASURE).",
-                )
-                self._add_cal_backup_panel(inner, row)
-                inner.columnconfigure(1, weight=1)
-            else:
-                row = 0
-                for block in [b for b in params.BLOCKS if b.group == group]:
-                    row = self._add_block(inner, block, row)
-                for param in [p for p in params.PARAMS if p.group == group]:
-                    row = self._add_param(inner, param, row)
-                inner.columnconfigure(1, weight=1)
-
-        diag = ttk.Frame(notebook, padding=8)
-        notebook.add(diag, text=params.GROUP_DIAG)
-        diag_inner = self._scrollable(diag)
-        self._build_diag_tab(diag_inner)
-
-        notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
-        for seq in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
-            notebook.bind(seq, self._on_tab_wheel)
-        self.root.bind_all("<Button-4>", self._on_tab_wheel, add="+")
-        self.root.bind_all("<Button-5>", self._on_tab_wheel, add="+")
-        self.root.bind_all("<MouseWheel>", self._on_tab_wheel, add="+")
-        self._on_notebook_tab_changed()
-
-    def _scrollable(self, parent: ttk.Frame) -> ttk.Frame:
-        canvas = tk.Canvas(parent, highlightthickness=0)
-        bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        canvas.configure(yscrollcommand=bar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        bar.pack(side="right", fill="y")
-        window = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        def on_configure(_event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfigure(window, width=canvas.winfo_width())
-
-        inner.bind("<Configure>", on_configure)
-        canvas.bind("<Configure>", on_configure)
-
-        self._tab_canvases.append(canvas)
-        for seq in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
-            canvas.bind(seq, self._on_tab_wheel)
-            inner.bind(seq, self._on_tab_wheel)
-        return inner
-
-    def _on_notebook_tab_changed(self, _event=None) -> None:
-        if self.notebook is None or not self._tab_canvases:
-            self._wheel_canvas = None
-            return
-        try:
-            idx = self.notebook.index(self.notebook.select())
-            self._wheel_canvas = self._tab_canvases[idx]
-        except (tk.TclError, IndexError):
-            self._wheel_canvas = self._tab_canvases[0]
-
-    def _as_widget(self, widget) -> tk.Misc | None:
-        # bind_all often delivers event.widget as a Tcl path string, not a Misc.
-        if widget is None:
-            return None
-        if isinstance(widget, str):
-            try:
-                return self.root.nametowidget(widget)
-            except (KeyError, tk.TclError):
-                return None
-        return widget
-
-    def _widget_is_descendant(self, widget, ancestor) -> bool:
-        w = self._as_widget(widget)
-        anc = self._as_widget(ancestor)
-        if w is None or anc is None:
-            return False
-        while w is not None:
-            if w == anc:
-                return True
-            w = w.master
-        return False
-
-    def _wheel_over_log(self, widget) -> bool:
-        log = getattr(self, "log_text", None)
-        return log is not None and self._widget_is_descendant(widget, log)
-
-    def _on_tab_wheel(self, event) -> str | None:
-        if self._wheel_over_log(event.widget):
-            return None
-        if self.notebook is not None:
-            x, y = self.root.winfo_pointerxy()
-            under = self.root.winfo_containing(x, y)
-            if under is None or not self._widget_is_descendant(under, self.notebook):
-                return None
-        canvas = self._wheel_canvas
-        if canvas is None:
-            return None
-        if event.num == 4:
-            canvas.yview_scroll(-2, "units")
-        elif event.num == 5:
-            canvas.yview_scroll(2, "units")
-        elif event.delta:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        return "break"
-
-    def _build_osc_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-
-        self._osc_split = ttk.Frame(parent)
-        self._osc_split.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        self._osc_col_left = ttk.Frame(self._osc_split)
-        self._osc_col_right = ttk.Frame(self._osc_split)
-
-        row = 0
-        row = self._add_osc_section(self._osc_col_left, row, "Pitch", OSC_PITCH_PIDS, columnspan=1)
-        row = self._add_osc_section(self._osc_col_left, row, "Sync", OSC_SYNC_PIDS, columnspan=1)
-        self._add_osc_section(self._osc_col_right, 0, "Voice & drift", OSC_VOICE_PIDS, columnspan=1)
-
-        row = self._add_osc_levels_row(parent, 1, OSC_LEVEL_PIDS)
-        self._add_osc_wave_matrix(parent, row)
-
-        self._osc_reflow_width = -1
-        parent.bind("<Configure>", self._osc_layout_reflow, add="+")
-        parent.after_idle(self._osc_layout_reflow)
-
-    def _osc_layout_reflow(self, event=None) -> None:
-        split = getattr(self, "_osc_split", None)
-        if split is None:
-            return
-        width = split.winfo_width()
-        if width < 8:
-            return
-        if width == self._osc_reflow_width:
-            return
-        self._osc_reflow_width = width
-
-        stacked = width < OSC_SPLIT_STACK_WIDTH
-        left = self._osc_col_left
-        right = self._osc_col_right
-
-        if stacked:
-            left.grid(row=0, column=0, sticky="ew")
-            right.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-            split.columnconfigure(0, weight=1)
-            split.columnconfigure(1, weight=0)
-        else:
-            left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-            right.grid(row=0, column=1, sticky="nsew")
-            split.columnconfigure(0, weight=1)
-            split.columnconfigure(1, weight=1)
-
-        left.columnconfigure(0, weight=1)
-        right.columnconfigure(0, weight=1)
-
-        cells = getattr(self, "_osc_level_cells", ())
-        levels_frame = getattr(self, "_osc_levels_frame", None)
-        if levels_frame is not None and cells:
-            compact = stacked or width < OSC_SPLIT_STACK_WIDTH + 120
-            for c in range(4):
-                levels_frame.columnconfigure(c, weight=0)
-            for r in range(2):
-                levels_frame.rowconfigure(r, weight=0)
-            if compact:
-                levels_frame.columnconfigure(0, weight=1)
-                levels_frame.columnconfigure(1, weight=1)
-                for i, cell in enumerate(cells):
-                    cell.grid(row=i // 2, column=i % 2, sticky="ew", padx=4, pady=4)
-            else:
-                for i, cell in enumerate(cells):
-                    levels_frame.columnconfigure(i, weight=1)
-                    cell.grid(row=0, column=i, sticky="ew", padx=4, pady=0)
-
-    def _build_env_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(1, weight=1)
-        self._env_scales = []
-        self._env_fader_length = -1
-        self._env_inner = parent
-
-        times = ttk.Frame(parent)
-        times.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
-        self._env_times = times
-        for col, key in enumerate(ENV_ADSR_BLOCKS):
-            self._add_adsr_block_vertical(times, self.blocks_by_key[key], col)
-        for c in range(len(ENV_ADSR_BLOCKS)):
-            self._env_times.columnconfigure(c, weight=1, uniform="env")
-        self._build_env_curves_row(times)
-
-        row = 1
-        for p in params.PARAMS:
-            if p.group == params.GROUP_ENV and p.pid not in ENV_CURVE_RESTART_PIDS:
-                row = self._add_param(parent, p, row)
-
-        parent.bind("<Configure>", self._env_fader_reflow, add="+")
-        parent.after_idle(self._env_fader_reflow)
-
-    def _env_fader_reflow(self, _event=None) -> None:
-        scales = getattr(self, "_env_scales", None)
-        inner = getattr(self, "_env_inner", None)
-        if not scales or inner is None:
-            return
-        canvas = inner.master
-        if not isinstance(canvas, tk.Canvas):
-            return
-        viewport_h = canvas.winfo_height()
-        if viewport_h < 2:
-            return
-        length = int(max(
-            ENV_ADSR_VFADER_MIN,
-            min(ENV_ADSR_VFADER_MAX, viewport_h * ENV_ADSR_VIEWPORT_FRAC),
-        ))
-        if length == self._env_fader_length:
-            return
-        self._env_fader_length = length
-        for scale in scales:
-            scale.configure(length=length)
-
-    def _add_adsr_block_vertical(self, parent: ttk.Frame, block: params.Block, column: int) -> None:
-        frame = ttk.LabelFrame(parent, text=block.label, padding=8)
-        frame.grid(row=0, column=column, sticky="ew", padx=(0, 8 if column < 2 else 0))
-        parent.columnconfigure(column, weight=1, uniform="env")
-
-        self.block_vars[block.key] = {}
-        for i, f in enumerate(block.fields):
-            cell = ttk.Frame(frame)
-            cell.grid(row=0, column=i, padx=4, sticky="new")
-            cell.columnconfigure(0, weight=1)
-            frame.columnconfigure(i, weight=1)
-            ttk.Label(cell, text=f.label).grid(row=0, column=0)
-            var = tk.DoubleVar(value=f.default)
-            self.block_vars[block.key][f.key] = var
-            readout = ttk.Label(cell, text=str(f.default), style="Readout.TLabel")
-
-            def on_slide(_v, key=block.key, var=var, rd=readout):
-                rd.config(text=str(ivar(var)))
-                if self._preset_loading:
-                    return
-                self.queue_block(key)
-
-            scale = _make_scale(
-                cell, lo=f.lo, hi=f.hi, var=var, command=on_slide,
-                orient="vertical", length=ENV_ADSR_VFADER_MIN,
-            )
-            scale.grid(row=1, column=0, pady=4)
-            readout.grid(row=2, column=0)
-            self._env_scales.append(scale)
-            self._readouts[("b", block.key, f.key)] = readout
-
-    def _add_env_curve_spin(self, cell: ttk.Frame, p: params.Param, short_label: str) -> None:
-        cell.columnconfigure(0, weight=1)
-        ttk.Label(cell, text=short_label).grid(row=0, column=0)
-        labels = [c[0] for c in p.choices]
-        lookup = dict(p.choices)
-        var = tk.StringVar(value=next((c[0] for c in p.choices if c[1] == p.default), labels[0]))
-        self.param_vars[p.pid] = var
-
-        def on_pick(_e=None, pid=p.pid, var=var, lookup=lookup):
-            if self._preset_loading:
-                return
-            self.queue_param(pid, lookup[var.get()])
-
-        combo = ttk.Combobox(cell, textvariable=var, values=labels, state="readonly",
-                             width=18)
-        combo.grid(row=1, column=0, pady=4, sticky="ew")
-        combo.bind("<<ComboboxSelected>>", on_pick)
-        tip = f"{p.label}  [{p.pid}]"
-        if p.note:
-            tip += f"\n{p.note}"
-        self._tooltip(combo, tip)
-
-    def _add_env_curve_column(self, parent: ttk.Frame, column: int, title: str,
-                              attack_pid: int | None, decay_pid: int | None,
-                              restart_pid: int | None, *, row: int = 1) -> None:
-        frame = ttk.LabelFrame(parent, text=title, padding=8)
-        frame.grid(row=row, column=column, sticky="ew", padx=(0, 8 if column < 2 else 0),
-                   pady=(8, 0) if row else 0)
-        parent.columnconfigure(column, weight=1, uniform="env")
-
-        if attack_pid is not None and decay_pid is not None:
-            for i, (pid, label) in enumerate(((attack_pid, "Attack"), (decay_pid, "Decay"))):
-                cell = ttk.Frame(frame)
-                cell.grid(row=0, column=i, padx=4, sticky="new")
-                frame.columnconfigure(i, weight=1)
-                self._add_env_curve_spin(cell, PARAM_BY_PID[pid], label)
-
-        if restart_pid is not None:
-            rp = PARAM_BY_PID[restart_pid]
-            restart_cell = ttk.Frame(frame)
-            restart_cell.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-            ttk.Label(restart_cell, text="Restart").grid(row=0, column=0, padx=(0, 4))
-            var = tk.IntVar(value=rp.default)
-            self.param_vars[rp.pid] = var
-
-            def on_check(pid=rp.pid, var=var):
-                if self._preset_loading:
-                    return
-                self.queue_param(pid, ivar(var))
-
-            btn = ttk.Checkbutton(restart_cell, variable=var, command=on_check,
-                                  style=theme.check_style())
-            btn.grid(row=0, column=1)
-            tip = f"{rp.label}  [{rp.pid}]"
-            if rp.note:
-                tip += f"\n{rp.note}"
-            self._tooltip(btn, tip)
-
-    def _build_env_curves_row(self, times: ttk.Frame, row: int = 1) -> None:
-        for col, (title, attack_pid, decay_pid, restart_pid) in enumerate(ENV_CURVE_COLUMNS):
-            self._add_env_curve_column(times, col, title, attack_pid, decay_pid, restart_pid, row=row)
-
-    def _add_osc_section(self, parent: ttk.Frame, row: int, title: str,
-                         pids: tuple[int, ...], *, columnspan: int = 3) -> int:
-        frame = ttk.LabelFrame(parent, text=title, padding=8)
-        frame.grid(row=row, column=0, columnspan=columnspan, sticky="ew", pady=(4, 10))
-        frame.columnconfigure(1, weight=1)
-        subrow = 0
-        for pid in pids:
-            subrow = self._add_param(frame, PARAM_BY_PID[pid], subrow)
-        return row + 1
-
-    def _add_osc_levels_row(self, parent: ttk.Frame, row: int, pids: tuple[int, ...]) -> int:
-        frame = ttk.LabelFrame(parent, text="Levels", padding=8)
-        frame.grid(row=row, column=0, sticky="ew", pady=(4, 10))
-        self._osc_levels_frame = frame
-        self._osc_level_cells = []
-        for pid in pids:
-            p = PARAM_BY_PID[pid]
-            if p.hidden:
-                continue
-            cell = ttk.Frame(frame)
-            self._osc_level_cells.append(cell)
-            self._add_osc_level_cell(cell, p)
-        return row + 1
-
-    def _add_osc_level_cell(self, cell: ttk.Frame, p: params.Param) -> None:
-        ttk.Label(cell, text=p.label).grid(row=0, column=0, columnspan=2, sticky="w")
-        var = tk.DoubleVar(value=p.default)
-        self.param_vars[p.pid] = var
-        readout = ttk.Label(cell, width=4, text=str(p.default), anchor="e",
-                            style="Readout.TLabel")
-
-        def on_slide(_v, pid=p.pid, var=var, rd=readout):
-            rd.config(text=str(ivar(var)))
-            if self._preset_loading:
-                return
-            self.queue_param(pid, ivar(var))
-
-        _make_scale(cell, lo=p.lo, hi=p.hi, var=var, command=on_slide).grid(
-            row=1, column=0, sticky="ew", pady=4)
-        readout.grid(row=1, column=1, sticky="e", padx=(4, 0))
-        cell.columnconfigure(0, weight=1)
-        self._readouts[("p", p.pid)] = readout
-
-    def _add_osc_wave_matrix(self, parent: ttk.Frame, row: int) -> None:
-        frame = ttk.LabelFrame(parent, text="Waveforms", padding=8)
-        frame.grid(row=row, column=0, sticky="ew", pady=(4, 10))
-        for col, title in enumerate(OSC_WAVE_COLS, start=1):
-            ttk.Label(frame, text=title).grid(row=0, column=col, padx=12, pady=(0, 4))
-        for r, (osc_label, pids) in enumerate(OSC_WAVE_MATRIX, start=1):
-            ttk.Label(frame, text=osc_label).grid(row=r, column=0, sticky="e", padx=(0, 12))
-            for c, pid in enumerate(pids, start=1):
-                if not PARAM_BY_PID[pid].hidden:
-                    self._wire_check(frame, PARAM_BY_PID[pid], row=r, column=c)
-
-    def _wire_check(self, parent: ttk.Frame, p: params.Param, *, row: int, column: int) -> None:
-        var = tk.IntVar(value=p.default)
-        self.param_vars[p.pid] = var
-
-        def on_check(pid=p.pid, var=var):
-            if self._preset_loading:
-                return
-            self.queue_param(pid, ivar(var))
-
-        btn = ttk.Checkbutton(parent, variable=var, command=on_check,
-                              style=theme.check_style())
-        btn.grid(row=row, column=column, padx=12, pady=2)
-        tip = f"{p.label}  [{p.pid}]"
-        if p.note:
-            tip += f"\n{p.note}"
-        self._tooltip(btn, tip)
-
-    def _add_pio_pulse_slider(self, parent: ttk.Frame, row: int) -> int:
-        """Calibration-only: PARAM_DEBUG_COMMAND 160 values 200..50000 set pioPulseLength."""
-        row_pad = 8
-        lo, hi, default = params.PIO_PULSE_LO, params.PIO_PULSE_HI, params.PIO_PULSE_DEFAULT
-        label = ttk.Label(parent, text=f"PIO pulse length (Y)  [{params.DEBUG_PARAM_ID}]")
-        label.grid(row=row, column=0, sticky="w", pady=row_pad, padx=(0, 10))
-        self._tooltip(
-            label,
-            "Reset pulse width in system clock cycles. Sent as unsigned 16-bit on "
-            "PARAM_DEBUG_COMMAND 160 (values 200–50000). Reloads running SMs via defer "
-            "reset (audible while a note is held); large changes may need amp-comp redo.",
-        )
-        var = tk.DoubleVar(value=default)
-        self.pio_pulse_var = var
-        readout = ttk.Label(parent, width=6, text=str(default), anchor="e",
-                            style="Readout.TLabel")
-        self._readouts[("pio_pulse",)] = readout
-
-        def on_slide(_v, var=var, rd=readout):
-            rd.config(text=str(ivar(var)))
-            if self._preset_loading:
-                return
-            self.queue_debug_u16(ivar(var))
-
-        _make_scale(parent, lo=lo, hi=hi, var=var, command=on_slide).grid(
-            row=row, column=1, sticky="ew", pady=row_pad)
-        readout.grid(row=row, column=2, sticky="e", padx=(8, 0))
-        return row + 1
-
-    def _add_character_jitter_sliders(self, parent: ttk.Frame, row: int) -> int:
-        """Character tab: diagnostic jitter amounts via packed PARAM_DEBUG_COMMAND 160."""
-        row_pad = 8
-        lo = params.CHARACTER_JITTER_LO
-        hi = params.CHARACTER_JITTER_HI
-        default = params.CHARACTER_JITTER_DEFAULT
-        for label_text, type_hi in params.CHARACTER_JITTERS:
-            label = ttk.Label(
-                parent, text=f"{label_text}  [{params.DEBUG_PARAM_ID}:0x{type_hi:02X}xx]")
-            label.grid(row=row, column=0, sticky="w", pady=row_pad, padx=(0, 10))
-            self._tooltip(
-                label,
-                f"Diagnostic only (not a ParamId). Sent as unsigned 16-bit on "
-                f"PARAM_DEBUG_COMMAND 160: (0x{type_hi:02X} << 8) | amount, amount 0..128. "
-                f"Stored in firmware; not applied to DSP yet.",
-            )
-            var = tk.DoubleVar(value=default)
-            self.character_jitter_vars[type_hi] = var
-            readout = ttk.Label(parent, width=6, text=str(default), anchor="e",
-                                style="Readout.TLabel")
-            self._readouts[("char_jitter", type_hi)] = readout
-
-            def on_slide(_v, var=var, rd=readout, type_hi=type_hi):
-                amount = ivar(var)
-                rd.config(text=str(amount))
-                if self._preset_loading:
-                    return
-                self.queue_debug_u16((type_hi << 8) | amount)
-
-            _make_scale(parent, lo=lo, hi=hi, var=var, command=on_slide).grid(
-                row=row, column=1, sticky="ew", pady=row_pad)
-            readout.grid(row=row, column=2, sticky="e", padx=(8, 0))
-            row += 1
-        return row
-
-    def _add_param(self, parent: ttk.Frame, p: params.Param, row: int) -> int:
-        if p.hidden:
-            return row  # model keeps the param (presets/MIDI) but not the GUI
-        row_pad = 8
-        label = ttk.Label(parent, text=f"{p.label}  [{p.pid}]")
-        label.grid(row=row, column=0, sticky="w", pady=row_pad, padx=(0, 10))
-        if p.note:
-            self._tooltip(label, p.note)
-
-        if p.pid == PID_MANUAL_CAL_STAGE:
-            # Packed substage walk: selectors, not a raw index (see calstages).
-            self._add_manual_cal_stage_selectors(parent, p, row=row, pady=row_pad)
-
-        elif p.kind == "slider":
-            var = tk.DoubleVar(value=p.default)
-            self.param_vars[p.pid] = var
-            readout = ttk.Label(parent, width=6, text=str(p.default), anchor="e",
-                                style="Readout.TLabel")
-
-            def on_slide(_v, pid=p.pid, var=var, rd=readout):
-                rd.config(text=str(ivar(var)))
-                if self._preset_loading or self._manual_cal_syncing:
-                    return
-                self.queue_param(pid, ivar(var))
-
-            scale = _make_scale(parent, lo=p.lo, hi=p.hi, var=var, command=on_slide)
-            scale.grid(row=row, column=1, sticky="ew", pady=row_pad)
-            readout.grid(row=row, column=2, sticky="e", padx=(8, 0))
-            self._readouts[("p", p.pid)] = readout
-            if p.pid in CAL_KIND_PIDS:
-                self._cal_kind_rows[p.pid] = (label, scale)
-
-        elif p.kind == "combo":
-            labels = [c[0] for c in p.choices]
-            lookup = dict(p.choices)
-            var = tk.StringVar(value=next((c[0] for c in p.choices if c[1] == p.default), labels[0]))
-            self.param_vars[p.pid] = var
-            combo = ttk.Combobox(parent, textvariable=var, values=labels, state="readonly")
-            combo.grid(row=row, column=1, sticky="ew", pady=row_pad)
-
-            def on_pick(_e=None, pid=p.pid, var=var, lookup=lookup):
-                if self._preset_loading:
-                    return
-                self.queue_param(pid, lookup[var.get()])
-
-            combo.bind("<<ComboboxSelected>>", on_pick)
-
-        elif p.kind == "check":
-            self._wire_check(parent, p, row=row, column=1)
-
-        elif p.kind == "pulse":
-            if p.pid == PID_RUN_AUTOTUNE:
-                # One value per calibration stage, so this param needs a strip.
-                self._add_cal_run_buttons(parent, p, row=row, pady=row_pad)
-            else:
-                def on_pulse(pid=p.pid, value=p.pulse_value, label=p.label):
-                    if not self._confirm_pulse(pid):
-                        return
-                    self.send_now(protocol.param16(pid, value))
-                    self.log(f"[send] {label} (param {pid} = {value})\n")
-                    self._on_pulse_sent(pid)
-
-                btn = ttk.Button(parent, text="Send", command=on_pulse)
-                btn.grid(row=row, column=1, sticky="w", pady=row_pad)
-                self._pulse_buttons[p.pid] = btn
-
-        return row + 1
-
-    def _add_manual_cal_stage_selectors(self, parent: ttk.Frame, p: params.Param, *,
-                                        row: int, pady: int) -> None:
-        """Param 152 row: pick an oscillator and a substage, send the stage value.
-
-        The wire value counts substages, and the walk is not uniform (DCO4 A
-        oscillators have a triangle and a PW substage its B sibling doesn't), so
-        a raw 0..27 slider says nothing about where it lands. The two selectors
-        are the walk the operator is actually doing; calstages turns them into
-        the stage byte and back.
-        """
-        var = tk.DoubleVar(value=p.default)
-        self.param_vars[p.pid] = var
-
-        strip = ttk.Frame(parent)
-        strip.grid(row=row, column=1, columnspan=2, sticky="ew", pady=pady)
-
-        osc_labels = [calstages.osc_label(o) for o in range(models.active().num_oscillators)]
-        self._cal_osc_var = tk.StringVar(value=osc_labels[0])
-        osc_combo = ttk.Combobox(strip, textvariable=self._cal_osc_var, values=osc_labels,
-                                 state="readonly", width=8)
-        osc_combo.grid(row=0, column=0, sticky="w")
-
-        self._cal_sub_var = tk.StringVar()
-        self._cal_sub_combo = ttk.Combobox(strip, textvariable=self._cal_sub_var,
-                                           state="readonly", width=12)
-        self._cal_sub_combo.grid(row=0, column=1, sticky="w", padx=(6, 0))
-
-        self._cal_stage_readout = ttk.Label(strip, text="", style="Muted.TLabel")
-        self._cal_stage_readout.grid(row=0, column=2, sticky="w", padx=(12, 0))
-
-        osc_combo.bind("<<ComboboxSelected>>", self._manual_cal_on_osc_picked)
-        self._cal_sub_combo.bind("<<ComboboxSelected>>", self._manual_cal_on_substage_picked)
-        self._manual_cal_fill_substages(0, calstages.KIND_SAW)
-        self._manual_cal_update_stage_readout()
-
-    def _manual_cal_fill_substages(self, osc: int, keep_kind: int | None) -> None:
-        """Repopulate the substage combo for one oscillator's part of the walk."""
-        kinds = calstages.kinds_for_osc(osc)
-        self._cal_sub_kinds = kinds
-        self._cal_sub_combo.config(values=[calstages.kind_label(k) for k in kinds])
-        kind = keep_kind if keep_kind in kinds else kinds[0]
-        self._cal_sub_var.set(calstages.kind_label(kind))
-
-    def _manual_cal_selected_osc(self) -> int:
-        label = self._cal_osc_var.get()
-        for osc in range(models.active().num_oscillators):
-            if calstages.osc_label(osc) == label:
-                return osc
-        return 0
-
-    def _manual_cal_selected_kind(self) -> int:
-        label = self._cal_sub_var.get()
-        for kind in self._cal_sub_kinds:
-            if calstages.kind_label(kind) == label:
-                return kind
-        return calstages.KIND_SAW
-
-    def _manual_cal_on_osc_picked(self, _event=None) -> None:
-        osc = self._manual_cal_selected_osc()
-        # An A-only substage (triangle, pulse-PW) has no counterpart on B, so
-        # the walk falls back to that oscillator's first substage.
-        self._manual_cal_fill_substages(osc, self._manual_cal_selected_kind())
-        self._manual_cal_send_stage()
-
-    def _manual_cal_on_substage_picked(self, _event=None) -> None:
-        self._manual_cal_send_stage()
-
-    def _manual_cal_send_stage(self) -> None:
-        stage = calstages.stage_for(self._manual_cal_selected_osc(),
-                                    self._manual_cal_selected_kind())
-        self.param_vars[PID_MANUAL_CAL_STAGE].set(stage)
-        self._manual_cal_update_stage_readout()
-        if self._preset_loading or self._manual_cal_syncing:
-            return
-        self.queue_param(PID_MANUAL_CAL_STAGE, stage)
-
-    def _manual_cal_sync_stage_selectors(self) -> None:
-        """Point the selectors at whatever stage the var holds (recall, presets)."""
-        if self._cal_stage_readout is None:
-            return
-        stage = max(0, min(calstages.stage_max(),
-                           ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
-        osc = calstages.stage_to_osc(stage)
-        self._cal_osc_var.set(calstages.osc_label(osc))
-        self._manual_cal_fill_substages(osc, calstages.stage_kind(stage))
-        self._manual_cal_update_stage_readout()
-
-    def _manual_cal_update_stage_readout(self) -> None:
-        if self._cal_stage_readout is None:
-            return
-        self._cal_stage_readout.config(
-            text=calstages.stage_text(ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
-
-    def _add_cal_run_buttons(self, parent: ttk.Frame, p: params.Param, *,
-                             row: int, pady: int) -> None:
-        """Param 150 button strip: one button per calibration stage, plus Stop.
-
-        The value picks the stage on the board (amp-comp tables, PW center and
-        limits, or both); 0 cancels a run that is blocking the board's core 1,
-        discarding the partial results of the interrupted stage. The precision
-        radio adds an offset to the stage value: Normal (+0) builds from
-        scratch, Fine (+4) measures far more carefully and makes the amp stage
-        refine the stored table instead of building a new one (so it needs a
-        calibrated board already), Fast (+8) is the quickest from-scratch
-        build for a testing table.
-        """
-        strip = ttk.Frame(parent)
-        strip.grid(row=row, column=1, columnspan=2, sticky="w", pady=pady)
-
-        precision_names = {off: name for name, off in params.CAL_PRECISION_CHOICES}
-
-        for col, (text, value) in enumerate(params.CAL_SCOPE_BUTTONS):
-            def on_run(value=value, text=text):
-                if not self._confirm_pulse(PID_RUN_AUTOTUNE):
-                    return
-                offset = int(self._cal_precision_var.get())
-                wire = value + offset
-                precision = precision_names.get(offset, "Normal")
-                self.send_now(protocol.param16(PID_RUN_AUTOTUNE, wire))
-                self.log(f"[send] Run {text} calibration "
-                         f"({precision.lower()}) "
-                         f"(param {PID_RUN_AUTOTUNE} = {wire})\n")
-                self._on_pulse_sent(PID_RUN_AUTOTUNE)
-
-            btn = ttk.Button(strip, text=text, command=on_run)
-            btn.grid(row=0, column=col, sticky="w", padx=(0 if col == 0 else 4, 0))
-            if value == params.CAL_SCOPE_FULL:
-                self._pulse_buttons[p.pid] = btn
-
-        def on_stop():
-            self.send_now(protocol.param16(PID_RUN_AUTOTUNE, 0))
-            self.log(f"[send] Stop calibration (param {PID_RUN_AUTOTUNE} = 0)\n")
-
-        ttk.Button(strip, text="Stop", command=on_stop).grid(
-            row=0, column=len(params.CAL_SCOPE_BUTTONS), sticky="w", padx=(12, 0))
-
-        radios = ttk.Frame(strip)
-        radios.grid(row=0, column=len(params.CAL_SCOPE_BUTTONS) + 1,
-                    sticky="w", padx=(12, 0))
-        for rcol, (name, offset) in enumerate(params.CAL_PRECISION_CHOICES):
-            ttk.Radiobutton(radios, text=name, value=offset,
-                            variable=self._cal_precision_var).grid(
-                row=0, column=rcol, sticky="w", padx=(0 if rcol == 0 else 6, 0))
-
-    def _add_block(self, parent: ttk.Frame, block: params.Block, row: int,
-                   *, columnspan: int = 3) -> int:
-        frame = ttk.LabelFrame(parent, text=block.label, padding=8)
-        frame.grid(row=row, column=0, columnspan=columnspan, sticky="ew", pady=(4, 10))
-        frame.columnconfigure(1, weight=1)
-
-        self.block_vars[block.key] = {}
-        for i, f in enumerate(block.fields):
-            ttk.Label(frame, text=f.label).grid(row=i, column=0, sticky="w", padx=(0, 10), pady=6)
-            var = tk.DoubleVar(value=f.default)
-            self.block_vars[block.key][f.key] = var
-            readout = ttk.Label(frame, width=6, text=str(f.default), anchor="e",
-                                style="Readout.TLabel")
-
-            def on_slide(_v, key=block.key, var=var, rd=readout):
-                rd.config(text=str(ivar(var)))
-                if self._preset_loading:
-                    return
-                self.queue_block(key)
-
-            _make_scale(frame, lo=f.lo, hi=f.hi, var=var, command=on_slide).grid(
-                row=i, column=1, sticky="ew", pady=6)
-            readout.grid(row=i, column=2, sticky="e", padx=(8, 0))
-            self._readouts[("b", block.key, f.key)] = readout
-
-        if block.note:
-            ttk.Label(frame, text=block.note, wraplength=700, style="Muted.TLabel").grid(
-                row=len(block.fields), column=0, columnspan=3, sticky="w", pady=(6, 0))
-        return row + 1
-
-    # --- manual calibration offset recall ---------------------------------
-
-    def _add_manual_cal_indicator(self, parent: ttk.Frame, row: int) -> int:
-        """Calibration tab: shows recall/dirty status for the manual offset sliders."""
-        label = ttk.Label(parent, text="", style="Muted.TLabel", wraplength=700)
-        label.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        self._manual_cal_indicator = label
-        self._update_manual_cal_indicator()
-        return row + 1
-
-    def _manual_cal_all_dirty(self) -> bool:
-        return bool(self._manual_cal_dirty or self._amp440_dirty
-                    or self._dutytrim_dirty or self._pwcenter_dirty)
-
-    def _manual_cal_dirty_text(self) -> str:
-        """Name the unsaved slots the way the walk does: OSC 1B, PW ch 2."""
-        names = [f"OSC {calstages.osc_label(o)}" for o in
-                 sorted(self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty)]
-        names += [f"PW ch {c}" for c in sorted(self._pwcenter_dirty)]
-        return ", ".join(names)
-
-    def _update_manual_cal_indicator(self) -> None:
-        if self._manual_cal_indicator is None:
-            return
-        if self._manual_cal_live is None:
-            text = ("Manual cal values: not read from the board yet -- enable "
-                    "Manual calibration mode to recall the stored values.")
-        elif self._manual_cal_all_dirty():
-            text = (f"Manual cal values: unsaved changes for {self._manual_cal_dirty_text()} -- "
-                    "press Store manual cal offsets before running autotune, or they "
-                    "will be discarded.")
-        else:
-            text = "Manual cal values: matches what's stored on the board."
-        self._manual_cal_indicator.config(text=text)
-
-    def _wire_manual_cal_recall(self) -> None:
-        """Hook the manual-cal mode/stage/offset/440-value vars so the sliders
-        always reflect the real per-oscillator values instead of whatever they
-        last showed."""
-        self.param_vars[PID_MANUAL_CAL_MODE].trace_add("write", self._manual_cal_on_mode_changed)
-        self.param_vars[PID_MANUAL_CAL_STAGE].trace_add("write", self._manual_cal_on_stage_changed)
-        self.param_vars[PID_MANUAL_CAL_OFFSET].trace_add("write", self._manual_cal_on_offset_changed)
-        self.param_vars[PID_AMP_COMP_440].trace_add("write", self._manual_cal_on_amp440_changed)
-        self.param_vars[PID_AMP_COMP_DUTY_OFFSET].trace_add(
-            "write", self._manual_cal_on_dutytrim_changed)
-        if PID_CAL_PW_CENTER in self.param_vars:
-            self.param_vars[PID_CAL_PW_CENTER].trace_add(
-                "write", self._manual_cal_on_pwcenter_changed)
-        self._manual_cal_apply_stage_enables()
-
-    def _manual_cal_on_mode_changed(self, *_args) -> None:
-        if self._manual_cal_syncing or self._preset_loading:
-            return
-        if ivar(self.param_vars[PID_MANUAL_CAL_MODE]) == 0:
-            return
-        if self._manual_cal_live is not None and self._manual_cal_all_dirty():
-            # Unsaved edits pending -- don't clobber them with a stale flash re-dump.
-            self._manual_cal_sync_controls()
-            return
-        self._manual_cal_refresh_from_board()
-
-    def _manual_cal_refresh_from_board(self) -> None:
-        """Recall the stored ManualOffset + AmpComp440 + duty trim + PW center
-        tables via the cal-dump path."""
-        if not self._mcu_ready():
-            self.log("[mcu] can't recall manual cal values -- not connected\n")
-            return
-
-        def pwcenter_done(ok, payload):
-            if not ok:
-                self.log(f"[mcu] PW center recall failed: {payload}\n")
-                return
-            try:
-                values = fileformats.decode_cal_table("PWCenter", payload)
-            except ValueError as exc:
-                self.log(f"[mcu] PW center recall: {exc}\n")
-                return
-            self._pwcenter_live = list(values)
-            self._pwcenter_baseline = list(values)
-            self._pwcenter_dirty.clear()
-            self._manual_cal_sync_controls()
-            self._update_manual_cal_indicator()
-            self.log(f"[mcu] PW centers recalled: {values}\n")
-
-        def dutytrim_done(ok, payload):
-            if not ok:
-                self.log(f"[mcu] duty trim recall failed: {payload}\n")
-                return
-            try:
-                values = fileformats.decode_cal_table("AmpCompDutyOffset", payload)
-            except ValueError as exc:
-                self.log(f"[mcu] duty trim recall: {exc}\n")
-                return
-            self._dutytrim_live = list(values)
-            self._dutytrim_baseline = list(values)
-            self._dutytrim_dirty.clear()
-            self._manual_cal_sync_controls()
-            self._update_manual_cal_indicator()
-            self.log(f"[mcu] duty trims recalled: {values}\n")
-            self.mcu.dump_cal_table("PWCenter", pwcenter_done)
-
-        def amp440_done(ok, payload):
-            if not ok:
-                self.log(f"[mcu] amp comp 440 recall failed: {payload}\n")
-                return
-            try:
-                values = fileformats.decode_cal_table("AmpComp440", payload)
-            except ValueError as exc:
-                self.log(f"[mcu] amp comp 440 recall: {exc}\n")
-                return
-            self._amp440_live = list(values)
-            self._amp440_baseline = list(values)
-            self._amp440_dirty.clear()
-            self._manual_cal_sync_controls()
-            self._update_manual_cal_indicator()
-            self.log(f"[mcu] amp comp 440 values recalled: {values}\n")
-            self.mcu.dump_cal_table("AmpCompDutyOffset", dutytrim_done)
-
-        def done(ok, payload):
-            if not ok:
-                self.log(f"[mcu] manual cal recall failed: {payload}\n")
-                return
-            try:
-                values = fileformats.decode_cal_table("ManualOffset", payload)
-            except ValueError as exc:
-                self.log(f"[mcu] manual cal recall: {exc}\n")
-                return
-            self._manual_cal_live = list(values)
-            self._manual_cal_baseline = list(values)
-            self._manual_cal_dirty.clear()
-            self._manual_cal_syncing = True
-            try:
-                # The board restarts its walk at stage 0 on every entry.
-                self.param_vars[PID_MANUAL_CAL_STAGE].set(0)
-                self._manual_cal_sync_stage_selectors()
-            finally:
-                self._manual_cal_syncing = False
-            self._manual_cal_sync_controls()
-            self._update_manual_cal_indicator()
-            self.log(f"[mcu] manual cal offsets recalled: {values}\n")
-            self.mcu.dump_cal_table("AmpComp440", amp440_done)
-
-        self.mcu.dump_cal_table("ManualOffset", done)
-
-    def _manual_cal_stage(self) -> int:
-        return max(0, min(calstages.stage_max(),
-                          ivar(self.param_vars[PID_MANUAL_CAL_STAGE])))
-
-    def _manual_cal_osc(self) -> int:
-        """Oscillator the current stage trims. Never the stage value itself."""
-        return calstages.stage_to_osc(self._manual_cal_stage())
-
-    def _manual_cal_sync_controls(self) -> None:
-        """Show the cached values for the oscillator the current stage trims."""
-        if self._manual_cal_live is None:
-            return
-        osc = min(self._manual_cal_osc(), len(self._manual_cal_live) - 1)
-        self._manual_cal_syncing = True
-        try:
-            self.param_vars[PID_MANUAL_CAL_OFFSET].set(self._manual_cal_live[osc])
-            if self._amp440_live is not None and osc < len(self._amp440_live):
-                stored = self._amp440_live[osc]
-                slider_min = PARAM_BY_PID[PID_AMP_COMP_440].lo
-                slider_max = PARAM_BY_PID[PID_AMP_COMP_440].hi
-                # Driving the Scale with a value outside [lo, hi] clamps the
-                # widget and fires on_slide, which used to send the clamp (700)
-                # to the board and overwrite flash 0 / out-of-range anchors.
-                # Keep the cache as the real stored value; only the Scale stays
-                # where it is, and the readout shows the truth.
-                if slider_min <= stored <= slider_max:
-                    self.param_vars[PID_AMP_COMP_440].set(stored)
-                else:
-                    label = calstages.osc_label(osc)
-                    if stored > slider_max:
-                        self.log(f"[cal] osc {label} amp comp @ 440 Hz is {stored}, "
-                                 f"above the slider maximum {slider_max}; the readout "
-                                 f"shows the stored value -- move the slider to dial "
-                                 f"a new one\n")
-                    else:
-                        what = "unset (0)" if stored == 0 else (
-                            f"{stored}, below the slider minimum {slider_min}")
-                        self.log(f"[cal] osc {label} amp comp @ 440 Hz is {what}; "
-                                 f"the stored value is kept -- move the slider to "
-                                 f"dial a real anchor\n")
-            if self._dutytrim_live is not None and osc < len(self._dutytrim_live):
-                self.param_vars[PID_AMP_COMP_DUTY_OFFSET].set(self._dutytrim_live[osc])
-            ch = calstages.pw_channel(osc)
-            if (PID_CAL_PW_CENTER in self.param_vars and self._pwcenter_live is not None
-                    and ch < len(self._pwcenter_live)):
-                self.param_vars[PID_CAL_PW_CENTER].set(self._pwcenter_live[ch])
-        finally:
-            self._manual_cal_syncing = False
-        self._manual_cal_apply_stage_enables()
-        self._sync_readouts()
-        # _sync_readouts() copies the Scale var; an out-of-range 440 value was
-        # never written there, so restore the real number on the label.
-        if self._amp440_live is not None and osc < len(self._amp440_live):
-            stored = self._amp440_live[osc]
-            lo = PARAM_BY_PID[PID_AMP_COMP_440].lo
-            hi = PARAM_BY_PID[PID_AMP_COMP_440].hi
-            if not (lo <= stored <= hi):
-                rd = self._readouts.get(("p", PID_AMP_COMP_440))
-                if rd is not None:
-                    rd.config(text=str(stored))
-
-    def _manual_cal_apply_stage_enables(self) -> None:
-        """Grey out the controls this substage's encoder does not drive."""
-        kind = calstages.stage_kind(self._manual_cal_stage())
-        for pid, (label, scale) in self._cal_kind_rows.items():
-            live = kind in CAL_KIND_PIDS[pid]
-            scale.state(["!disabled" if live else "disabled"])
-            # The theme draws a disabled Label as a filled box, which reads like
-            # a field rather than a dead control; mute the text instead.
-            label.configure(style="TLabel" if live else "Muted.TLabel")
-
-    def _manual_cal_on_stage_changed(self, *_args) -> None:
-        if self._manual_cal_syncing:
-            return
-        self._manual_cal_update_stage_readout()
-        if self._manual_cal_live is None:
-            self._manual_cal_apply_stage_enables()
-            return
-        self._manual_cal_sync_controls()
-
-    def _manual_cal_on_offset_changed(self, *_args) -> None:
-        if self._manual_cal_syncing or self._manual_cal_live is None:
-            return
-        self._manual_cal_track_edit(self._manual_cal_live, self._manual_cal_baseline,
-                                    self._manual_cal_dirty, self._manual_cal_osc(),
-                                    ivar(self.param_vars[PID_MANUAL_CAL_OFFSET]))
-
-    def _manual_cal_on_amp440_changed(self, *_args) -> None:
-        if self._manual_cal_syncing or self._amp440_live is None:
-            return
-        self._manual_cal_track_edit(self._amp440_live, self._amp440_baseline,
-                                    self._amp440_dirty, self._manual_cal_osc(),
-                                    ivar(self.param_vars[PID_AMP_COMP_440]))
-
-    def _manual_cal_on_dutytrim_changed(self, *_args) -> None:
-        if self._manual_cal_syncing or self._dutytrim_live is None:
-            return
-        self._manual_cal_track_edit(self._dutytrim_live, self._dutytrim_baseline,
-                                    self._dutytrim_dirty, self._manual_cal_osc(),
-                                    ivar(self.param_vars[PID_AMP_COMP_DUTY_OFFSET]))
-
-    def _manual_cal_on_pwcenter_changed(self, *_args) -> None:
-        if self._manual_cal_syncing or self._pwcenter_live is None:
-            return
-        self._manual_cal_track_edit(self._pwcenter_live, self._pwcenter_baseline,
-                                    self._pwcenter_dirty,
-                                    calstages.pw_channel(self._manual_cal_osc()),
-                                    ivar(self.param_vars[PID_CAL_PW_CENTER]))
-
-    def _manual_cal_track_edit(self, live: list[int], baseline: list[int] | None,
-                               dirty: set[int], index: int, value: int) -> None:
-        """Cache an edit and flag the slot when it no longer matches the board."""
-        if index >= len(live):
-            return
-        live[index] = value
-        stored = baseline[index] if baseline and index < len(baseline) else 0
-        if value != stored:
-            dirty.add(index)
-        else:
-            dirty.discard(index)
-        self._update_manual_cal_indicator()
-
-    def _manual_cal_on_stored(self) -> None:
-        if self._manual_cal_live is not None:
-            self._manual_cal_baseline = list(self._manual_cal_live)
-        self._manual_cal_dirty.clear()
-        if self._amp440_live is not None:
-            self._amp440_baseline = list(self._amp440_live)
-        self._amp440_dirty.clear()
-        if self._dutytrim_live is not None:
-            self._dutytrim_baseline = list(self._dutytrim_live)
-        self._dutytrim_dirty.clear()
-        if self._pwcenter_live is not None:
-            self._pwcenter_baseline = list(self._pwcenter_live)
-        self._pwcenter_dirty.clear()
-        self._update_manual_cal_indicator()
-
-    def _confirm_pulse(self, pid: int) -> bool:
-        """Gate a calibration run: warn before it discards unsaved manual values."""
-        if pid != PID_RUN_AUTOTUNE or not self._manual_cal_all_dirty():
-            return True
-        choice = messagebox.askyesnocancel(
-            "Unsaved manual calibration values",
-            f"{self._manual_cal_dirty_text()} have unsaved manual calibration values.\n\n"
-            "Auto calibration reloads the board's filesystem when it finishes, "
-            "which discards any manual offset edit that wasn't stored.\n\n"
-            "Yes: store them now, then calibrate.\n"
-            "No: calibrate anyway and discard the unsaved edits.\n"
-            "Cancel: don't calibrate.",
-            parent=self.root,
-        )
-        if choice is None:
-            return False
-        if choice:
-            store = PARAM_BY_PID[PID_MANUAL_CAL_STORE]
-            self.send_now(protocol.param16(PID_MANUAL_CAL_STORE, store.pulse_value))
-            self.log(f"[send] {store.label} (param {PID_MANUAL_CAL_STORE} = {store.pulse_value})\n")
-            self._manual_cal_on_stored()
-        return True
-
-    def _on_pulse_sent(self, pid: int) -> None:
-        """Hook for after-send bookkeeping. Most pulses don't need this."""
-        if pid == PID_MANUAL_CAL_STORE:
-            self._manual_cal_on_stored()
-
-    @staticmethod
-    def _note_tracks_width(frame: tk.Widget, label: ttk.Label, *,
-                           beside: tk.Widget | None = None, extra: int = 24) -> None:
-        """Wrap a note at the frame's live width instead of the fixed diag-tab 340 px.
-
-        The Calibration-tab panels span the whole tab, so a fixed wrap turns a
-        one-line note into a tall paragraph with empty space to its right.
-        """
-        last = {"wrap": -1}
-
-        def on_configure(event):
-            reserved = extra + (beside.winfo_width() if beside is not None else 0)
-            wrap = max(event.width - reserved, 160)
-            if abs(wrap - last["wrap"]) < 8:
-                return  # ignore the reflow our own wraplength change triggers
-            last["wrap"] = wrap
-            label.config(wraplength=wrap)
-
-        frame.bind("<Configure>", on_configure, add="+")
-
-    def _add_cal_diag_panel(self, parent: ttk.Frame, row: int, title: str,
-                            commands: tuple[tuple[str, int], ...], note: str) -> int:
-        """Calibration-tab debug button box: one button row, note underneath."""
-        if not commands:
-            return row
-        panel = self._add_diag_panel(parent, row=row, column=0, title=title,
-                                     commands=commands, note=note)
-        panel.grid_configure(columnspan=3, sticky="ew")
-        buttons: list[ttk.Button] = panel._diag_buttons  # type: ignore[attr-defined]
-        for i, btn in enumerate(buttons):
-            btn.grid(row=0, column=i, sticky="w", padx=(0 if i == 0 else 4, 0), pady=1)
-        note_label: ttk.Label = panel._diag_note_label  # type: ignore[attr-defined]
-        note_label.grid(row=1, column=0, columnspan=max(len(buttons), 1),
-                        sticky="w", pady=(2, 0))
-        self._note_tracks_width(panel, note_label)
-        return row + 1
-
-    def _add_cal_backup_panel(self, parent: ttk.Frame, row: int) -> None:
-        """Calibration tab: dump/restore the board's six LittleFS cal tables."""
-        frame = ttk.LabelFrame(parent, text="Calibration backup", padding=8)
-        frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=0, column=0, sticky="w")
-        ttk.Button(buttons, text="Dump board → file…",
-                   command=self._cal_dump_to_file).grid(row=0, column=0, sticky="w")
-        ttk.Button(buttons, text="Load file → board…",
-                   command=self._cal_load_from_file).grid(row=0, column=1, sticky="w", padx=(6, 0))
-        note = ttk.Label(
-            frame,
-            text=f"All six cal tables as {fileformats.cal_format()} JSON; loading "
-                 "overwrites the board's LittleFS and reloads it live.",
-            style="Muted.TLabel",
-        )
-        note.grid(row=0, column=1, sticky="w", padx=(12, 0))
-        frame.columnconfigure(1, weight=1)
-        self._note_tracks_width(frame, note, beside=buttons)
-
-    def _add_diag_panel(self, parent: ttk.Frame, *, row: int, column: int, title: str,
-                        commands: tuple[tuple[str, int], ...], note: str) -> ttk.LabelFrame:
-        frame = ttk.LabelFrame(parent, text=title, padding=DIAG_FRAME_PAD)
-        frame.grid(row=row, column=column, sticky="ew", pady=DIAG_SECTION_PADY)
-        buttons: list[ttk.Button] = []
-        for label, value in commands:
-            def on_click(value=value, label=label):
-                self.send_now(protocol.param16(params.DEBUG_PARAM_ID, value))
-                self.log(f"[send] {label}\n")
-
-            buttons.append(ttk.Button(frame, text=label, command=on_click))
-        frame._diag_buttons = buttons  # type: ignore[attr-defined]
-        note_label = ttk.Label(frame, text=note, wraplength=340, style="Muted.TLabel")
-        frame._diag_note_label = note_label  # type: ignore[attr-defined]
-        return frame
-
-    def _diag_panel_ncol(self, panel_w: int, n_buttons: int, stacked: bool) -> int:
-        if n_buttons <= 1:
-            return 1
-        ncol = 2
-        if stacked and panel_w >= 640:
-            ncol = 3
-        elif not stacked and panel_w >= 400:
-            ncol = 3
-        return min(ncol, n_buttons)
-
-    def _diag_reflow_panel(self, frame: ttk.LabelFrame, panel_w: int, stacked: bool,
-                           wrap: int) -> None:
-        buttons: list[ttk.Button] = frame._diag_buttons  # type: ignore[attr-defined]
-        ncol = self._diag_panel_ncol(panel_w, len(buttons), stacked)
-        for c in range(max(ncol, 1)):
-            frame.columnconfigure(c, weight=1)
-        for i, btn in enumerate(buttons):
-            btn.grid(row=i // ncol, column=i % ncol, padx=2, pady=1, sticky="ew")
-        btn_rows = (len(buttons) - 1) // ncol + 1 if buttons else 0
-        note_label: ttk.Label = frame._diag_note_label  # type: ignore[attr-defined]
-        note_label.config(wraplength=wrap)
-        note_label.grid(row=btn_rows, column=0, columnspan=ncol, sticky="ew", pady=(4, 0))
-
-    def _build_diag_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=1)
-        self._diag_grid = parent
-        self._diag_reflow_width = -1
-
-        panel_specs = [
-            ("Diagnostics", models.filter_debug_commands(params.DEBUG_COMMANDS),
-             "Output appears in the log below. Period probes only hold while no note "
-             "is playing. Dump RAM (13) prints heap + per-core stack (needs ENABLE_MEM_DIAG). "
-             "14/15 disable/enable mem_diag loop polls (A/B vs profiler). "
-             "Note retrig 26/27 A/B EXACT_Y vs SYNC_JMP (needs oscSync ≥ 1); "
-             "Board ack note_retrig=… when RUNNING_AVERAGE.", 0, 0),
-            ("Hot-path profiler", params.BENCH_COMMANDS,
-             "Needs RUNNING_AVERAGE in the firmware (otherwise these are no-ops). "
-             "Dump is asynchronous: core 0 prints after both cores snapshot. "
-             "Toggle prints 'bench periodic on/off' immediately; the tables land "
-             "in the Board output pane (drag the sash to enlarge it).", 0, 1),
-            ("Amp-comp method / bench", params.AMP_COMP_COMMANDS,
-             "Method buttons (20–22) switch the live lookup for profiler / speed A/B "
-             "(PWM difference is tiny — expect Board ack amp_comp method=…). "
-             "FLOAT_QUAD=cached walk. "
-             "Speed/accuracy (24–25) need AMP_COMP_BENCHMARK + "
-             "RUNNING_AVERAGE; confirm live_method= on the speed report.",
-             1, 0),
-            ("Pitch-interp bench", params.PITCH_INTERP_COMMANDS,
-             "Speed/accuracy (28–29) need RUNNING_AVERAGE (paced Board output). "
-             "Compares FLOAT / RATIO_Q16 / Q12 (private tables; Q20 slope is inside RATIO). "
-             "Profiler dump (10) prints build: … pitch=… flags.", 1, 1),
-            ("Clkdiv GOLD_REF / LIVE / FLOAT / Q16 / Q8 / Q4", params.CLKDIV_HP_COMMANDS,
-             "Speed/accuracy (32–33) need RUNNING_AVERAGE (paced Board output). "
-             "All seven methods on both voice engines. GOLD_REF = true-Hz llround (speed 100%). "
-             "Fixed: Q24 helpers. Float: native Hz for GOLD/FLOAT; Hz→Q24 then helper for integer. "
-             "Accuracy vs GOLD_REF. Live float honors CLKDIV_MODE via clkdiv_live_hz.",
-             2, 0),
-        ]
-        if models.active().has_mainboard:
-            panel_specs.append(
-                ("Mainboard profiler", params.BENCH_MB_COMMANDS,
-                 "DCO forwards 45 (dump once) and 42 (toggle ~1 Hz) to the STM32 "
-                 "Mainboard over Serial2; ASCII comes back as text chunks into the "
-                 "Board output pane. Needs RUNNING_AVERAGE in the Mainboard firmware. "
-                 "(40/41 are amp-0 mode on the DCO, not Mainboard dump/reset.)", 2, 1))
-        mcp_row, mcp_col = (3, 0) if models.active().has_mainboard else (2, 1)
-        panel_specs.append(
-            ("MCP4728 DACs", params.MCP_DAC_COMMANDS,
-             "Output appears in the Board pane. DCO4 forwards 43/44 to the STM32 "
-             "Mainboard over Serial2 (same path as opcode 42). DCO3 runs them on "
-             "the DCO when ENABLE_MCP4728 is on; otherwise the board prints "
-             "mcp4728 compiled out. Probe does not mute analog writes.",
-             mcp_row, mcp_col))
-        self._diag_panels = []
-        for title, commands, note, grid_row, grid_col in panel_specs:
-            frame = self._add_diag_panel(
-                parent, row=grid_row, column=grid_col, title=title,
-                commands=commands, note=note,
-            )
-            self._diag_panels.append((frame, grid_row, grid_col))
-
-        parent.bind("<Configure>", self._diag_layout_reflow, add="+")
-        parent.after_idle(self._diag_layout_reflow)
-
-    def _diag_layout_reflow(self, _event=None) -> None:
-        grid = getattr(self, "_diag_grid", None)
-        panels = getattr(self, "_diag_panels", None)
-        if grid is None or not panels:
-            return
-        width = grid.winfo_width()
-        if width < 2 or width == self._diag_reflow_width:
-            return
-        self._diag_reflow_width = width
-        stacked = width < DIAG_SPLIT_STACK_WIDTH
-        panel_w = width if stacked else max(200, width // 2 - 16)
-        wrap = 700 if stacked else max(280, width // 2 - 24)
-        for i, (frame, wide_row, wide_col) in enumerate(panels):
-            if stacked:
-                frame.grid(row=i, column=0, columnspan=2, sticky="ew", pady=DIAG_SECTION_PADY)
-            else:
-                frame.grid(row=wide_row, column=wide_col, columnspan=1, sticky="ew",
-                           padx=(0, 4 if wide_col == 0 else 0), pady=DIAG_SECTION_PADY)
-            self._diag_reflow_panel(frame, panel_w, stacked, wrap)
-
-    def _tooltip(self, widget: tk.Widget, text: str) -> None:
-        state: dict[str, tk.Toplevel | None] = {"win": None}
-
-        def show(_e):
-            if state["win"] is not None:
-                return
-            # Created on hover, so the startup retint() cannot reach it: colour it here.
-            p = theme.palette()
-            win = tk.Toplevel(widget)
-            win.wm_overrideredirect(True)
-            win.wm_geometry(f"+{widget.winfo_rootx() + 20}+{widget.winfo_rooty() + widget.winfo_height() + 4}")
-            win.configure(background=p["border"])
-            tk.Label(win, text=text, justify="left", wraplength=420, padx=8, pady=5,
-                     background=p["surface"], foreground=p["fg"],
-                     relief="flat", borderwidth=0).pack(padx=1, pady=1)
-            state["win"] = win
-
-        def hide(_e):
-            if state["win"] is not None:
-                state["win"].destroy()
-                state["win"] = None
-
-        widget.bind("<Enter>", show)
-        widget.bind("<Leave>", hide)
-
-    # --- log -------------------------------------------------------------
-
-    def _build_log(self) -> None:
-        frame = ttk.LabelFrame(self.paned, text="Board output", padding=6)
-        self.paned.add(frame, weight=1)
-        self.log_text = tk.Text(frame, height=6, wrap="none")
-        vbar = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
-        hbar = ttk.Scrollbar(frame, orient="horizontal", command=self.log_text.xview)
-        self.log_text.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        vbar.grid(row=0, column=1, sticky="ns")
-        hbar.grid(row=1, column=0, sticky="ew")
-        ttk.Button(frame, text="Clear", command=lambda: self.log_text.delete("1.0", "end")).grid(
-            row=2, column=0, columnspan=2, sticky="e", pady=(4, 0))
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-
-        def on_log_wheel(event):
-            if event.num == 4:
-                self.log_text.yview_scroll(-2, "units")
-            elif event.num == 5:
-                self.log_text.yview_scroll(2, "units")
-            elif event.delta:
-                self.log_text.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
-
-        for seq in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
-            self.log_text.bind(seq, on_log_wheel)
-
-    def _style_log_tags(self) -> None:
-        p = theme.palette()
-        self.log_text.tag_configure("link", foreground=p["accent"])
-        self.log_text.tag_configure("send", foreground=p["muted"])
-        self.log_text.tag_configure("ui", foreground=p["muted"])
-        self.log_text.tag_configure("mcu", foreground=p["accent"])
-
-    def log(self, text: str) -> None:
-        # Arduino Serial.println() is CRLF. Tk Text treats \r as a glyph, which
-        # showed up as a junk character on the short calibration-table dump lines.
-        text = text.replace("\r", "")
-        # Tag our own lines so they read as commentary, leaving board output plain.
-        tag = ""
-        for name in ("link", "send", "ui", "mcu"):
-            if text.startswith(f"[{name}]"):
-                tag = name
-                break
-        self.log_text.insert("end", text, tag or ())
-        # Keep the buffer bounded; DCO_DEBUG_REPORT is chatty.
-        if int(self.log_text.index("end-1c").split(".")[0]) > 2000:
-            self.log_text.delete("1.0", "500.0")
-        self.log_text.see("end")
-
-    def _drain_log(self) -> None:
-        try:
-            while True:
-                chunk = self.link.rx.get_nowait()
-                self.log(chunk)
-                self._mcu_feed(chunk)
-        except queue.Empty:
-            pass
-        self.mcu.tick()
-        if self.dot_on and not self.link.is_open:
-            # A failed write closes the link from the reader thread's side.
-            self._set_status_dot(False)
-            self.status_var.set("not connected")
-            self.connect_btn.config(text="Connect")
-            self.mcu.cancel_all()
-        self.root.after(50, self._drain_log)
-
-    def _mcu_feed(self, chunk: str) -> None:
-        """Reassemble the RX stream into lines for the MCU protocol parser."""
-        self._mcu_linebuf += chunk
+        self.connect_btn.setText("Disconnect")
+        self.status_label.setText(f"connected: {device}")
+        self.status_dot.setStyleSheet(f"color: {theme.PALETTES[self.mode]['ok']};")
+        self.log(f"[link] connected to {device}\n")
+        self.send_all()
+
+    def _on_data_received(self, text: str) -> None:
+        self.log(text)
+        self._mcu_linebuf += text
         while "\n" in self._mcu_linebuf:
             line, self._mcu_linebuf = self._mcu_linebuf.split("\n", 1)
             self.mcu.feed_line(line.rstrip("\r"))
-        if len(self._mcu_linebuf) > 4096:  # runaway line; nothing we parse is this long
+        if len(self._mcu_linebuf) > 4096:
             self._mcu_linebuf = ""
 
-    # --- sending ---------------------------------------------------------
+    def _on_write_failed(self, err: str) -> None:
+        self.log(f"[link] write failed: {err}\n")
+        self._toggle_connect()
 
-    def _enqueue(self, key: str, frame: bytes) -> None:
-        """Stage a frame; last write for the same key wins until the next flush."""
-        self.pending[key] = protocol.stuff(frame)
+    def log(self, text: str) -> None:
+        text = text.replace("\r", "")
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
 
-    def queue_param(self, pid: int, value: int) -> None:
-        """Stage a 16-bit parameter frame (coalesced by the 20 ms flush)."""
-        self._enqueue(f"p{pid}", protocol.param16(pid, int(value)))
+        fmt = QTextCharFormat()
+        palette = theme.PALETTES[self.mode]
+        if text.startswith("[link]"):
+            fmt.setForeground(QColor(palette["accent"]))
+        elif text.startswith("[send]") or text.startswith("[ui]"):
+            fmt.setForeground(QColor(palette["muted"]))
+        elif text.startswith("[mcu]"):
+            fmt.setForeground(QColor(palette["ok"]))
+        else:
+            fmt.setForeground(QColor(palette["fg"]))
 
-    def queue_debug_u16(self, value: int) -> None:
-        """Stage unsigned 16-bit PARAM_DEBUG_COMMAND (e.g. pioPulseLength)."""
-        self._enqueue(
-            "p_debug_u16", protocol.param16u(params.DEBUG_PARAM_ID, int(value)))
+        cursor.insertText(text, fmt)
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
+
+    # --- Senders ---
+
+    def queue_param(self, pid: int, val: int) -> None:
+        self.pending[f"p{pid}"] = protocol.stuff(protocol.param16(pid, int(val)))
+
+    def queue_debug_u16(self, val: int) -> None:
+        self.pending["p_debug_u16"] = protocol.stuff(protocol.param16u(params.DEBUG_PARAM_ID, int(val)))
 
     def queue_block(self, key: str) -> None:
         block = self.blocks_by_key[key]
-        values = {k: ivar(v) for k, v in self.block_vars[key].items()}
-        self._enqueue(f"b{key}", block.builder(values))
+        vals = {f.key: self.block_widgets[key][f.key].value() for f in block.fields}  # type: ignore[union-attr]
+        self.pending[f"b{key}"] = protocol.stuff(block.builder(vals))
 
     def send_now(self, frame: bytes) -> None:
-        if not self.link.is_open:
-            self.log("[link] not connected\n")
-            return
-        self.link.send(protocol.stuff(frame))
-
-    def _flush_pending(self) -> int:
-        """Send staged frames if connected. Clears only after a successful send."""
-        if not self.pending or not self.link.is_open:
-            return 0
-        frames = list(self.pending.values())
-        self.link.send(b"".join(frames))
-        n = len(frames)
-        self.pending.clear()
-        return n
+        if self.link.is_open:
+            self.link.send(protocol.stuff(frame))
 
     def _flush(self) -> None:
-        """Periodic coalesce tick: deliver pending when linked; keep staging offline."""
-        self._flush_pending()
-        self.root.after(SEND_INTERVAL_MS, self._flush)
+        if not self.pending or not self.link.is_open:
+            return
+        frames = list(self.pending.values())
+        self.link.send(b"".join(frames))
+        self.pending.clear()
 
     def send_all(self) -> int:
-        """Push the sound patch once. Returns the number of frames sent.
-
-        Calibration, Diagnostics, and bench/debug controls are omitted — those send
-        only when the user operates them. Needed after connecting: the board boots
-        with its own defaults and has no idea what this window is showing.
-
-        On models whose DCO relays Screen signals (has_screen_signals) the push is
-        bracketed by a Silent signal and a slot+name scroll, so the Screen follows
-        the panel's preset instead of the Input board's last selection.
-        """
         if not self.link.is_open:
-            self.log("[link] not connected\n")
             return 0
-        # UI is authoritative; drop any stale offline queue before the full push.
         self.pending.clear()
         n = 0
         screen = models.active().has_screen_signals
         if screen:
-            # Screen Silent first so toasts do not fight the later slot/name scroll.
             self.send_now(protocol.screen_signal(protocol.SCREEN_SIGNAL_SILENT))
             n += 1
         for p in presets.patch_params():
-            self.queue_param(p.pid, self._param_value(p))
+            w = self.param_widgets.get(p.pid)
+            val = p.default
+            if isinstance(w, QSlider):
+                val = w.value()
+            elif isinstance(w, QComboBox):
+                val = w.currentData()
+            elif isinstance(w, QCheckBox):
+                val = 1 if w.isChecked() else 0
+            self.queue_param(p.pid, val)
             n += 1
         for block in presets.patch_blocks():
             self.queue_block(block.key)
             n += 1
-        self._flush_pending()
+        self._flush()
         if screen:
-            # 16-byte USB 'q' fills DCO presetName[]; then PARAM_UI_PRESET_SCROLL
-            # emits the 17-byte Screen 'q' + PresetScroll. Not PARAM_PRESET_LOAD
-            # (that would recall LittleFS instead of this PC bank).
-            self.send_now(protocol.preset_name(self.preset_name_var.get()))
-            self.send_now(protocol.param16(
-                protocol.PARAM_UI_PRESET_SCROLL, self._preset_slot_index()))
+            self.send_now(protocol.preset_name(self.preset_name_entry.text()))
+            self.send_now(protocol.param16(protocol.PARAM_UI_PRESET_SCROLL, self.preset_spin.value()))
             n += 2
         self.log(f"[send] patch {n} frames\n")
         return n
 
-    def _param_value(self, p: params.Param) -> int:
-        var = self.param_vars.get(p.pid)
-        if var is None:
-            return p.default
-        if p.kind == "combo":
-            return dict(p.choices)[var.get()]
-        return ivar(var)
-
     def reset_defaults(self) -> None:
-        self._preset_loading = True
-        try:
-            for p in params.PARAMS:
-                var = self.param_vars.get(p.pid)
-                if var is None:
-                    continue
-                if p.kind == "combo":
-                    var.set(next(c[0] for c in p.choices if c[1] == p.default))
-                else:
-                    var.set(p.default)
-            for block in params.BLOCKS:
-                for f in block.fields:
-                    self.block_vars[block.key][f.key].set(f.default)
-            if self.pio_pulse_var is not None:
-                self.pio_pulse_var.set(params.PIO_PULSE_DEFAULT)
-            for var in self.character_jitter_vars.values():
-                var.set(params.CHARACTER_JITTER_DEFAULT)
-        finally:
-            self._preset_loading = False
-        self._sync_readouts()
-        self._refresh_dirty()
-        self.log("[ui] controls reset to defaults -- press 'Send all' to push them\n")
+        self._preset_init()
 
-    def _on_close(self) -> None:
+    def closeEvent(self, event) -> None:
         self.link.close()
-        self.root.destroy()
+        event.accept()
 
 
-class PresetBrowser(tk.Toplevel):
-    """256-slot bank browser: local slot management, patch files, MCU sync.
-
-    The MCU column shows the board's own preset names from the last directory
-    fetch ([pdir]); it is empty until "Refresh board list" is pressed. All board
-    operations run through app.mcu one at a time and report to the log pane.
-    """
-
+class PresetBrowser(QDialog):
     def __init__(self, app: App) -> None:
-        super().__init__(app.root)
+        super().__init__(app)
         self.app = app
-        self.title("Preset browser")
-        self.geometry("780x680")
-        self.minsize(600, 440)
+        self.setWindowTitle("Preset Browser")
+        self.resize(720, 600)
 
-        body = ttk.Frame(self, padding=8)
-        body.pack(fill="both", expand=True)
+        lay = QVBoxLayout(self)
+        self.table = QTableWidget(presets.NUM_SLOTS, 3)
+        self.table.setHorizontalHeaderLabels(["Slot", "Local Name", "Board Name"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.cellDoubleClicked.connect(lambda: self._local_load())
+        lay.addWidget(self.table)
 
-        columns = ("slot", "name", "mcu")
-        self.tree = ttk.Treeview(body, columns=columns, show="headings",
-                                 selectmode="browse")
-        self.tree.heading("slot", text="Slot")
-        self.tree.heading("name", text="Local name")
-        self.tree.heading("mcu", text="Board name")
-        self.tree.column("slot", width=60, anchor="e", stretch=False)
-        self.tree.column("name", width=300)
-        self.tree.column("mcu", width=240)
-        bar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=bar.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        bar.grid(row=0, column=1, sticky="ns")
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
-        self.tree.bind("<Double-1>", lambda _e: self._local_load())
-
-        local = ttk.LabelFrame(body, text="Local bank", padding=6)
-        local.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        for text, cmd in (
+        # Local Actions
+        local_box = QGroupBox("Local Bank")
+        l_lay = QHBoxLayout(local_box)
+        for name, fn in (
             ("Load", self._local_load),
-            ("Save into", self._local_save_into),
-            ("Rename…", self._local_rename),
-            ("Copy to…", self._local_copy_to),
-            ("Move to…", self._local_move_to),
+            ("Save Into", self._local_save_into),
+            ("Rename", self._local_rename),
             ("Delete", self._local_delete),
-            ("Export slot…", self._file_export),
-            ("Import into slot…", self._file_import),
         ):
-            ttk.Button(local, text=text, command=cmd).pack(side="left", padx=(0, 6))
+            btn = QPushButton(name)
+            btn.clicked.connect(fn)
+            l_lay.addWidget(btn)
+        lay.addWidget(local_box)
 
-        mcu = ttk.LabelFrame(body, text="Board (MCU)", padding=6)
-        mcu.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        mcu_specs = (
-            ("Refresh board list", self._mcu_refresh_dir),
-            ("Send slot → board", self._mcu_send_slot),
-            ("Fetch slot ← board", self._mcu_fetch_slot),
-            ("Recall slot on board", self._mcu_recall),
-            ("Push all → board", self._mcu_push_all),
-            ("Pull all ← board", self._mcu_pull_all),
-            ("Save board live state → slot", self._mcu_save_live),
-        )
-        for i, (text, cmd) in enumerate(mcu_specs):
-            ttk.Button(mcu, text=text, command=cmd).grid(
-                row=i // 4, column=i % 4, padx=(0, 6), pady=2, sticky="ew")
+        # MCU Actions
+        mcu_box = QGroupBox("Board (MCU)")
+        m_lay = QHBoxLayout(mcu_box)
+        for name, fn in (
+            ("Refresh Board List", self._mcu_refresh_dir),
+            ("Send Slot → Board", self._mcu_send_slot),
+            ("Fetch Slot ← Board", self._mcu_fetch_slot),
+            ("Push All", self._mcu_push_all),
+            ("Pull All", self._mcu_pull_all),
+        ):
+            btn = QPushButton(name)
+            btn.clicked.connect(fn)
+            m_lay.addWidget(btn)
+        lay.addWidget(mcu_box)
 
         self.refresh()
 
-    # --- helpers ----------------------------------------------------------
-
-    def log(self, text: str) -> None:
-        self.app.log(text)
-
-    def _sel(self) -> int | None:
-        sel = self.tree.selection()
-        if not sel:
-            self.log("[ui] select a slot in the browser first\n")
-            return None
-        return int(sel[0])
+    def _selected_row(self) -> int:
+        rows = self.table.selectionModel().selectedRows()
+        return rows[0].row() if rows else 0
 
     def refresh(self) -> None:
-        selected = self.tree.selection()
-        top = self.tree.yview()[0]
-        self.tree.delete(*self.tree.get_children())
         for i in range(presets.NUM_SLOTS):
             slot = self.app.bank["slots"][i]
             name = "" if presets.slot_is_empty(slot) else slot["name"]
-            self.tree.insert("", "end", iid=str(i),
-                             values=(f"{i:03d}", name, self.app.mcu_dir.get(i, "")))
-        if selected:
-            self.tree.selection_set(selected)
-        self.tree.yview_moveto(top)
-
-    def _safe_refresh(self) -> None:
-        """Refresh from an async MCU callback; the window may have been closed."""
-        try:
-            if self.winfo_exists():
-                self.refresh()
-        except tk.TclError:
-            pass
-
-    def _local_slot(self, index: int) -> dict | None:
-        slot = self.app.bank["slots"][index]
-        return None if presets.slot_is_empty(slot) else slot
-
-    def _save_bank(self) -> None:
-        presets.save_bank(self.app.bank)
-        # save_bank normalizes; keep the in-memory copy identical to disk.
-        self.app.bank = presets.load_bank()
-        self.refresh()
-
-    # --- local bank ---------------------------------------------------------
+            mcu_name = self.app.mcu_dir.get(i, "")
+            self.table.setItem(i, 0, QTableWidgetItem(f"{i:03d}"))
+            self.table.setItem(i, 1, QTableWidgetItem(name))
+            self.table.setItem(i, 2, QTableWidgetItem(mcu_name))
 
     def _local_load(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        self.app._preset_recall(i, send=True, persist_current=True)
+        self.app._preset_recall(self._selected_row(), send=True, persist_current=True)
 
     def _local_save_into(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        existing = self._local_slot(i)
-        if existing is not None and not messagebox.askyesno(
-            "Save into slot",
-            f"Slot {i:03d} already has “{existing['name']}”. Overwrite?",
-            parent=self,
-        ):
-            return
-        self.app._preset_save(i)
+        self.app._preset_save(self._selected_row())
+        self.refresh()
 
     def _local_rename(self) -> None:
-        i = self._sel()
-        if i is None:
+        idx = self._selected_row()
+        slot = self.app.bank["slots"][idx]
+        if presets.slot_is_empty(slot):
             return
-        slot = self._local_slot(i)
-        if slot is None:
-            self.log(f"[ui] slot {i:03d} is empty\n")
-            return
-        name = simpledialog.askstring(
-            "Rename preset", "Name:", initialvalue=slot["name"], parent=self)
-        if name is None:
-            return
-        slot["name"] = name.strip()[:48] or "Untitled"
-        if i == int(self.app.bank.get("current", -1)):
-            self.app.preset_name_var.set(slot["name"])
-        self._save_bank()
-        self.log(f"[preset] renamed {i:03d} to {slot['name']}\n")
-
-    def _pick_dest(self, title: str, source: int) -> int | None:
-        dest = simpledialog.askinteger(
-            title, "Destination slot (0–255):", initialvalue=source,
-            minvalue=0, maxvalue=presets.NUM_SLOTS - 1, parent=self)
-        if dest is None or dest == source:
-            return None
-        existing = self._local_slot(dest)
-        if existing is not None and not messagebox.askyesno(
-            title, f"Slot {dest:03d} already has “{existing['name']}”. Overwrite?",
-            parent=self,
-        ):
-            return None
-        return dest
-
-    def _local_copy_to(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        slot = self._local_slot(i)
-        if slot is None:
-            self.log(f"[ui] slot {i:03d} is empty\n")
-            return
-        dest = self._pick_dest("Copy to…", i)
-        if dest is None:
-            return
-        self.app.bank["slots"][dest] = presets.normalize_bank({"slots": [slot]})["slots"][0]
-        self._save_bank()
-        self.log(f"[preset] copied {i:03d} to {dest:03d}\n")
-
-    def _local_move_to(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        slot = self._local_slot(i)
-        if slot is None:
-            self.log(f"[ui] slot {i:03d} is empty\n")
-            return
-        dest = self._pick_dest("Move to…", i)
-        if dest is None:
-            return
-        self.app.bank["slots"][dest] = slot
-        self.app.bank["slots"][i] = None
-        self._save_bank()
-        self.log(f"[preset] moved {i:03d} to {dest:03d}\n")
+        name, ok = QInputDialog.getText(self, "Rename", "Name:", text=slot["name"])
+        if ok:
+            slot["name"] = name.strip() or "Untitled"
+            presets.save_bank(self.app.bank)
+            self.refresh()
 
     def _local_delete(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        slot = self._local_slot(i)
-        if slot is None:
-            return
-        if not messagebox.askyesno(
-            "Delete preset", f"Delete {i:03d} “{slot['name']}” from the local bank?",
-            parent=self,
-        ):
-            return
-        self.app.bank["slots"][i] = None
-        self._save_bank()  # slot 0 re-inits to defaults; others go empty
-        self.log(f"[preset] deleted {i:03d}\n")
-
-    # --- patch files ----------------------------------------------------------
-
-    def _file_export(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        slot = self._local_slot(i)
-        if slot is None:
-            self.log(f"[ui] slot {i:03d} is empty\n")
-            return
-        path = filedialog.asksaveasfilename(
-            parent=self, title="Export slot", defaultextension=".json",
-            initialfile=f"{slot['name']}.json", filetypes=JSON_FILETYPES)
-        if not path:
-            return
-        try:
-            fileformats.save_patch_file(path, slot)
-        except OSError as exc:
-            self.log(f"[ui] patch export failed: {exc}\n")
-            return
-        self.log(f"[ui] exported {i:03d} \"{slot['name']}\" to {path}\n")
-
-    def _file_import(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        path = filedialog.askopenfilename(
-            parent=self, title="Import patch into slot", filetypes=JSON_FILETYPES)
-        if not path:
-            return
-        try:
-            slot = fileformats.load_patch_file(path)
-        except (OSError, ValueError) as exc:
-            self.log(f"[ui] patch import failed: {exc}\n")
-            return
-        existing = self._local_slot(i)
-        if existing is not None and not messagebox.askyesno(
-            "Import into slot",
-            f"Slot {i:03d} already has “{existing['name']}”. Overwrite with "
-            f"“{slot['name']}”?",
-            parent=self,
-        ):
-            return
-        self.app.bank["slots"][i] = slot
-        self._save_bank()
-        self.log(f"[ui] imported \"{slot['name']}\" into {i:03d}\n")
-
-    # --- board (MCU) sync -------------------------------------------------------
+        idx = self._selected_row()
+        self.app.bank["slots"][idx] = None
+        presets.save_bank(self.app.bank)
+        self.refresh()
 
     def _mcu_refresh_dir(self) -> None:
-        app = self.app
-        if not app._mcu_ready():
+        if not self.app._mcu_ready():
             return
+        self.app.mcu.read_directory(lambda ok, payload: self._on_dir_done(ok, payload))
 
-        def done(ok, payload):
-            if not ok:
-                self.log(f"[mcu] directory listing failed: {payload}\n")
-                return
-            app.mcu_dir = dict(payload)
-            self.log(f"[mcu] board has {len(payload)} preset(s)\n")
-            self._safe_refresh()
-
-        app.mcu.read_directory(done)
+    def _on_dir_done(self, ok: bool, payload: list) -> None:
+        if ok:
+            self.app.mcu_dir = dict(payload)
+            self.refresh()
 
     def _mcu_send_slot(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        slot = self._local_slot(i)
-        if slot is None:
-            self.log(f"[ui] slot {i:03d} is empty\n")
-            return
-        app = self.app
-        if not app._mcu_ready():
-            return
-        record = fileformats.slot_to_record(slot)
-
-        def done(ok, payload, i=i, name=slot["name"]):
-            if ok:
-                app.mcu_dir[i] = name[:16]
-                self.log(f"[mcu] slot {i:03d} \"{name}\" written to board\n")
-                self._safe_refresh()
-            else:
-                self.log(f"[mcu] send slot {i:03d} failed: {payload}\n")
-
-        app.mcu.push_preset_record(i, record, done)
+        idx = self._selected_row()
+        slot = self.app.bank["slots"][idx]
+        if not presets.slot_is_empty(slot) and self.app._mcu_ready():
+            rec = fileformats.slot_to_record(slot)
+            self.app.mcu.push_preset_record(idx, rec, lambda ok, _: self._mcu_refresh_dir())
 
     def _mcu_fetch_slot(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        app = self.app
-        if not app._mcu_ready():
-            return
-        existing = self._local_slot(i)
-        if existing is not None and not messagebox.askyesno(
-            "Fetch slot",
-            f"Overwrite local slot {i:03d} “{existing['name']}” with the board's "
-            "copy?",
-            parent=self,
-        ):
-            return
+        idx = self._selected_row()
+        if self.app._mcu_ready():
+            self.app.mcu.dump_preset_slot(
+                idx, lambda ok, payload: self._on_fetched_slot(idx, ok, payload)
+            )
 
-        def done(ok, payload, i=i):
-            if not ok:
-                self.log(f"[mcu] fetch slot {i:03d} failed: {payload}\n")
-                return
-            try:
-                slot = fileformats.record_to_slot(payload)
-            except ValueError as exc:
-                self.log(f"[mcu] fetch slot {i:03d}: bad record ({exc})\n")
-                return
-            app.bank["slots"][i] = slot
-            app.mcu_dir[i] = slot["name"][:16]
-            self._save_bank()
-            self.log(f"[mcu] fetched slot {i:03d} \"{slot['name']}\" from board\n")
-
-        app.mcu.dump_preset_slot(i, done)
-
-    def _mcu_recall(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        app = self.app
-        if not app._mcu_ready():
-            return
-
-        def done(ok, payload, i=i):
-            if ok:
-                self.log(f"[mcu] board recalled slot {i:03d} (panel UI unchanged -- "
-                         "use Fetch to sync it here)\n")
-            else:
-                self.log(f"[mcu] recall slot {i:03d} failed: {payload}\n")
-
-        app.mcu.recall_slot(i, done)
-
-    def _mcu_save_live(self) -> None:
-        i = self._sel()
-        if i is None:
-            return
-        app = self.app
-        if not app._mcu_ready():
-            return
-        name = simpledialog.askstring(
-            "Save board live state", "Preset name (16 chars reach the board):",
-            initialvalue=app.preset_name_var.get().strip()[:16], parent=self)
-        if name is None:
-            return
-        name = name.strip() or "Untitled"
-
-        def done(ok, payload, i=i, name=name):
-            if ok:
-                app.mcu_dir[i] = name[:16]
-                self.log(f"[mcu] board saved its live state into slot {i:03d}\n")
-                self._safe_refresh()
-            else:
-                self.log(f"[mcu] board save failed: {payload}\n")
-
-        app.mcu.save_live_to_slot(i, name, done)
+    def _on_fetched_slot(self, idx: int, ok: bool, payload: bytes) -> None:
+        if ok:
+            slot = fileformats.record_to_slot(payload)
+            self.app.bank["slots"][idx] = slot
+            presets.save_bank(self.app.bank)
+            self.refresh()
 
     def _mcu_push_all(self) -> None:
-        app = self.app
-        if not app._mcu_ready():
+        entries = [(i, s) for i, s in enumerate(self.app.bank["slots"]) if not presets.slot_is_empty(s)]
+        if not entries or not self.app._mcu_ready():
             return
-        entries = [
-            (i, s) for i, s in enumerate(app.bank["slots"])
-            if not presets.slot_is_empty(s)
-        ]
-        if not entries:
-            self.log("[ui] local bank is empty\n")
-            return
-        if not messagebox.askyesno(
-            "Push all",
-            f"Write {len(entries)} local preset(s) into the board's slots? "
-            "Matching board slots are overwritten.",
-            parent=self,
-        ):
-            return
-        state = {"fail": 0}
 
-        def step(k: int) -> None:
+        def step(k: int):
             if k >= len(entries):
-                ok_n = len(entries) - state["fail"]
-                self.log(f"[mcu] push all done: {ok_n} ok, {state['fail']} failed\n")
-                self._safe_refresh()
+                self._mcu_refresh_dir()
                 return
             i, slot = entries[k]
+            self.app.mcu.push_preset_record(i, fileformats.slot_to_record(slot), lambda ok, _: step(k + 1))
 
-            def done(ok, payload, i=i, name=slot["name"], k=k):
-                if ok:
-                    app.mcu_dir[i] = name[:16]
-                else:
-                    state["fail"] += 1
-                    self.log(f"[mcu] push slot {i:03d} failed: {payload}\n")
-                step(k + 1)
-
-            app.mcu.push_preset_record(i, fileformats.slot_to_record(slot), done)
-
-        self.log(f"[mcu] pushing {len(entries)} preset(s) to the board...\n")
         step(0)
 
     def _mcu_pull_all(self) -> None:
-        app = self.app
-        if not app._mcu_ready():
+        if not self.app._mcu_ready():
             return
 
         def on_dir(ok, payload):
-            if not ok:
-                self.log(f"[mcu] directory listing failed: {payload}\n")
+            if not ok or not payload:
                 return
-            app.mcu_dir = dict(payload)
-            self._safe_refresh()
-            if not payload:
-                self.log("[mcu] board has no presets\n")
-                return
-            if not messagebox.askyesno(
-                "Pull all",
-                f"Copy {len(payload)} preset(s) from the board into the local bank? "
-                "Matching local slots are overwritten.",
-                parent=self,
-            ):
-                return
-            slots = [slot for slot, _name in payload]
-            state = {"fail": 0}
+            slots = [s for s, _ in payload]
 
-            def step(k: int) -> None:
+            def step(k: int):
                 if k >= len(slots):
-                    ok_n = len(slots) - state["fail"]
-                    self._save_bank()
-                    self.log(f"[mcu] pull all done: {ok_n} ok, {state['fail']} failed\n")
+                    presets.save_bank(self.app.bank)
+                    self.refresh()
                     return
                 i = slots[k]
+                self.app.mcu.dump_preset_slot(
+                    i, lambda ok, p: self._on_pulled_step(i, ok, p, lambda: step(k + 1))
+                )
 
-                def done(ok, payload, i=i, k=k):
-                    if ok:
-                        try:
-                            app.bank["slots"][i] = fileformats.record_to_slot(payload)
-                        except ValueError as exc:
-                            state["fail"] += 1
-                            self.log(f"[mcu] pull slot {i:03d}: bad record ({exc})\n")
-                    else:
-                        state["fail"] += 1
-                        self.log(f"[mcu] pull slot {i:03d} failed: {payload}\n")
-                    step(k + 1)
-
-                app.mcu.dump_preset_slot(i, done)
-
-            self.log(f"[mcu] pulling {len(slots)} preset(s) from the board...\n")
             step(0)
 
-        app.mcu.read_directory(on_dir)
+        self.app.mcu.read_directory(on_dir)
+
+    def _on_pulled_step(self, i: int, ok: bool, payload: bytes, next_fn) -> None:
+        if ok:
+            try:
+                self.app.bank["slots"][i] = fileformats.record_to_slot(payload)
+            except ValueError:
+                pass
+        next_fn()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="DCO bench controller")
-    ap.add_argument("--port", help="serial device, e.g. /dev/ttyACM0 (default: auto-detect)")
-    ap.add_argument("--model", choices=sorted(models.PROFILES),
-                    help="synth model (default: auto-detect from USB, else "
-                         f"DCO_CONTROL_MODEL env, else {models.active().key})")
-    ap.add_argument("--theme", choices=theme.MODES, default="dark",
-                    help="colour scheme; also switchable from the toolbar (default: dark)")
-    ap.add_argument("--cobs", action="store_true",
-                    help="COBS on-wire framing (match firmware SERIAL_FRAMING_COBS)")
+    ap = argparse.ArgumentParser(description="DCO Bench Controller (PySide6)")
+    ap.add_argument("--port", help="serial device (e.g. /dev/ttyACM0)")
+    ap.add_argument("--model", choices=sorted(models.PROFILES))
+    ap.add_argument("--theme", choices=theme.PALETTES.keys(), default="dark")
+    ap.add_argument("--cobs", action="store_true")
     args = ap.parse_args()
 
     env_cobs = os.environ.get("DCO_SERIAL_COBS", "").strip().lower() in ("1", "true", "yes")
@@ -2714,9 +1636,10 @@ def main() -> None:
         models.set_active(model)
     apply_active_model()
 
-    root = tk.Tk()
-    App(root, args.port, args.theme, cobs=cobs)
-    root.mainloop()
+    q_app = QApplication(sys.argv)
+    window = App(args.port, mode=args.theme, cobs=cobs)
+    window.show()
+    sys.exit(q_app.exec())
 
 
 if __name__ == "__main__":
