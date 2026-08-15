@@ -5,19 +5,40 @@ from __future__ import annotations
 
 import argparse
 import os
-import queue
 import sys
 import threading
 
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
-    QSlider, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
-    QTabWidget, QVBoxLayout, QWidget, QMenu
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 import calstages
@@ -71,6 +92,18 @@ CAL_KIND_PIDS = {
     PID_CAL_PW_CENTER: (calstages.KIND_PULSE_PW,),
     PID_AMP_COMP_440: (calstages.KIND_440,),
 }
+
+ZOOM_LEVELS = [
+    ("80%", 0.80),
+    ("90%", 0.90),
+    ("100%", 1.00),
+    ("110%", 1.10),
+    ("125%", 1.25),
+    ("140%", 1.40),
+    ("160%", 1.60),
+    ("180%", 1.80),
+    ("200%", 2.00),
+]
 
 
 def apply_active_model() -> None:
@@ -140,10 +173,18 @@ class Link:
 
 
 class App(QMainWindow):
-    def __init__(self, preferred_port: str | None, mode: str = "dark", cobs: bool = False) -> None:
+    def __init__(
+        self,
+        preferred_port: str | None,
+        mode: str = theme.DEFAULT_THEME,
+        base_font_size: int = 12,
+        cobs: bool = False,
+    ) -> None:
         super().__init__()
         protocol.use_cobs = cobs
-        self.mode = mode
+        self.mode = mode if mode in theme.PALETTES else theme.DEFAULT_THEME
+        self.base_font_size = base_font_size
+        self.zoom_scale = 1.0
         self.blocks_by_key = {b.key: b for b in params.BLOCKS}
 
         # Serial Link
@@ -200,11 +241,12 @@ class App(QMainWindow):
 
         # GUI Setup
         self.setWindowTitle(f"DCO Bench Controller — {models.active().display_name}")
-        self.resize(1140, 920)
-        self.setMinimumSize(900, 600)
-        self._apply_theme()
+        self.resize(1180, 940)
+        self.setMinimumSize(920, 600)
 
         self._build_ui(preferred_port)
+        self._setup_shortcuts()
+        self._apply_theme()
         self._init_presets()
 
         # Timers
@@ -216,13 +258,72 @@ class App(QMainWindow):
         self.mcu_timer.timeout.connect(self.mcu.tick)
         self.mcu_timer.start(50)
 
-    def _apply_theme(self) -> None:
-        self.setStyleSheet(theme.build_stylesheet(self.mode))
+    # --- Theming & Scaling ---
 
-    def _toggle_theme(self) -> None:
-        self.mode = "light" if self.mode == "dark" else "dark"
-        self._apply_theme()
-        self.theme_btn.setText("Light" if self.mode == "dark" else "Dark")
+    def _apply_theme(self) -> None:
+        effective_font_size = max(8, int(self.base_font_size * self.zoom_scale))
+        self.setStyleSheet(theme.build_stylesheet(self.mode, effective_font_size))
+        
+        # Apply global application font
+        app = QApplication.instance()
+        if app:
+            font = app.font()
+            font.setPointSize(effective_font_size)
+            app.setFont(font)
+
+        if hasattr(self, "status_dot") and hasattr(self, "link"):
+            dot_col = (
+                theme.PALETTES[self.mode]["ok"]
+                if self.link.is_open
+                else theme.PALETTES[self.mode]["off"]
+            )
+            self.status_dot.setStyleSheet(
+                f"color: {dot_col}; font-size: {effective_font_size + 3}px;"
+            )
+
+    def _on_theme_selected(self, index: int) -> None:
+        key = self.theme_combo.itemData(index)
+        if key in theme.PALETTES:
+            self.mode = key
+            self._apply_theme()
+
+    def _on_zoom_selected(self, index: int) -> None:
+        scale = self.zoom_combo.itemData(index)
+        if scale:
+            self.zoom_scale = scale
+            self._apply_theme()
+
+    def _zoom_in(self) -> None:
+        idx = self.zoom_combo.currentIndex()
+        if idx < self.zoom_combo.count() - 1:
+            self.zoom_combo.setCurrentIndex(idx + 1)
+
+    def _zoom_out(self) -> None:
+        idx = self.zoom_combo.currentIndex()
+        if idx > 0:
+            self.zoom_combo.setCurrentIndex(idx - 1)
+
+    def _zoom_reset(self) -> None:
+        idx = self.zoom_combo.findData(1.00)
+        if idx != -1:
+            self.zoom_combo.setCurrentIndex(idx)
+
+    def _setup_shortcuts(self) -> None:
+        # Ctrl + / Ctrl - / Ctrl 0 zoom shortcuts
+        act_in = QAction(self)
+        act_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
+        act_in.triggered.connect(self._zoom_in)
+        self.addAction(act_in)
+
+        act_out = QAction(self)
+        act_out.setShortcut(QKeySequence("Ctrl+-"))
+        act_out.triggered.connect(self._zoom_out)
+        self.addAction(act_out)
+
+        act_reset = QAction(self)
+        act_reset.setShortcut(QKeySequence("Ctrl+0"))
+        act_reset.triggered.connect(self._zoom_reset)
+        self.addAction(act_reset)
 
     # --- UI Layout Builders ---
 
@@ -258,7 +359,7 @@ class App(QMainWindow):
 
         lay.addWidget(QLabel("Port"))
         self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(220)
+        self.port_combo.setMinimumWidth(200)
         lay.addWidget(self.port_combo)
         self._refresh_ports(preferred_port)
 
@@ -270,9 +371,9 @@ class App(QMainWindow):
         self.connect_btn.clicked.connect(self._toggle_connect)
         lay.addWidget(self.connect_btn)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        lay.addWidget(sep)
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.VLine)
+        lay.addWidget(sep1)
 
         send_all_btn = QPushButton("Send all")
         send_all_btn.setObjectName("AccentButton")
@@ -285,17 +386,53 @@ class App(QMainWindow):
 
         lay.addStretch(1)
 
+        # Status
         self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet(f"color: {theme.PALETTES[self.mode]['off']}; font-size: 14px;")
+        self.status_dot.setStyleSheet(
+            f"color: {theme.PALETTES[self.mode]['off']}; font-size: 14px;"
+        )
         lay.addWidget(self.status_dot)
 
         self.status_label = QLabel("not connected")
         self.status_label.setObjectName("MutedLabel")
         lay.addWidget(self.status_label)
 
-        self.theme_btn = QPushButton("Light" if self.mode == "dark" else "Dark")
-        self.theme_btn.clicked.connect(self._toggle_theme)
-        lay.addWidget(self.theme_btn)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        lay.addWidget(sep2)
+
+        # Zoom Controls
+        lay.addWidget(QLabel("Zoom"))
+        btn_zoom_out = QPushButton("−")
+        btn_zoom_out.setFixedWidth(24)
+        btn_zoom_out.setToolTip("Zoom Out (Ctrl -)")
+        btn_zoom_out.clicked.connect(self._zoom_out)
+        lay.addWidget(btn_zoom_out)
+
+        self.zoom_combo = QComboBox()
+        for text, scale in ZOOM_LEVELS:
+            self.zoom_combo.addItem(text, scale)
+        self.zoom_combo.setCurrentIndex(self.zoom_combo.findData(1.00))
+        self.zoom_combo.currentIndexChanged.connect(self._on_zoom_selected)
+        lay.addWidget(self.zoom_combo)
+
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_in.setFixedWidth(24)
+        btn_zoom_in.setToolTip("Zoom In (Ctrl +)")
+        btn_zoom_in.clicked.connect(self._zoom_in)
+        lay.addWidget(btn_zoom_in)
+
+        # Theme Selector Dropdown
+        lay.addWidget(QLabel("Theme"))
+        self.theme_combo = QComboBox()
+        for key, p in theme.PALETTES.items():
+            self.theme_combo.addItem(p["name"], key)
+
+        idx = self.theme_combo.findData(self.mode)
+        if idx != -1:
+            self.theme_combo.setCurrentIndex(idx)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_selected)
+        lay.addWidget(self.theme_combo)
 
         return bar
 
@@ -405,11 +542,14 @@ class App(QMainWindow):
                 self._wire_manual_cal_recall()
                 self._add_pio_pulse_slider(lay)
                 self._add_cal_diag_panel(
-                    lay, "Dev tables", params.CAL_DEBUG_COMMANDS,
+                    lay,
+                    "Dev tables",
+                    params.CAL_DEBUG_COMMANDS,
                     "Seed force-writes fake amp-comp + PW tables. Verify sweep measures duty errors.",
                 )
                 self._add_cal_diag_panel(
-                    lay, "Amp-comp calibration method",
+                    lay,
+                    "Amp-comp calibration method",
                     models.filter_debug_commands(params.AMP_CAL_METHOD_COMMANDS),
                     "Search used to build amp-comp tables. Runtime-only.",
                 )
@@ -518,7 +658,9 @@ class App(QMainWindow):
                 rd.setObjectName("ReadoutLabel")
 
                 slider.valueChanged.connect(
-                    lambda val, bkey=bkey, fkey=f.key, rd=rd: self._on_block_slider_changed(bkey, fkey, val, rd)
+                    lambda val, bkey=bkey, fkey=f.key, rd=rd: self._on_block_slider_changed(
+                        bkey, fkey, val, rd
+                    )
                 )
                 col.addWidget(slider, 1, Qt.AlignmentFlag.AlignCenter)
                 col.addWidget(rd, 0, Qt.AlignmentFlag.AlignCenter)
@@ -541,9 +683,13 @@ class App(QMainWindow):
                     cb = QComboBox()
                     for label, val in p.choices:
                         cb.addItem(label, val)
-                    cb.setCurrentIndex(next(i for i, c in enumerate(p.choices) if c[1] == p.default))
+                    cb.setCurrentIndex(
+                        next(i for i, c in enumerate(p.choices) if c[1] == p.default)
+                    )
                     cb.currentIndexChanged.connect(
-                        lambda idx, pid=p.pid, cb=cb: self._on_combo_changed(pid, cb.itemData(idx))
+                        lambda idx, pid=p.pid, cb=cb: self._on_combo_changed(
+                            pid, cb.itemData(idx)
+                        )
                     )
                     clay.addWidget(cb)
                     self.param_widgets[p.pid] = cb
@@ -567,25 +713,70 @@ class App(QMainWindow):
 
     # --- Diagnostics Tab ---
 
+# --- Diagnostics Tab ---
+
     def _build_diag_tab(self, parent_layout: QVBoxLayout) -> None:
         grid = QGridLayout()
         panel_specs = [
-            ("Diagnostics", models.filter_debug_commands(params.DEBUG_COMMANDS),
-             "RAM dumps, period probes, note retrig.", 0, 0),
-            ("Hot-path profiler", params.BENCH_COMMANDS,
-             "Needs RUNNING_AVERAGE in firmware.", 0, 1),
-            ("Amp-comp method / bench", params.AMP_COMP_COMMANDS,
-             "Speed/accuracy benchmarks.", 1, 0),
-            ("Pitch-interp bench", params.PITCH_INTERP_COMMANDS,
-             "Compares FLOAT / RATIO_Q16 / Q12.", 1, 1),
-            ("Clkdiv methods", params.CLKDIV_HP_COMMANDS,
-             "Speed & accuracy vs GOLD_REF.", 2, 0),
+            (
+                "Diagnostics",
+                models.filter_debug_commands(params.DEBUG_COMMANDS),
+                "RAM dumps, period probes, note retrig.",
+                0,
+                0,
+            ),
+            (
+                "Hot-path profiler",
+                params.BENCH_COMMANDS,
+                "Needs RUNNING_AVERAGE in firmware.",
+                0,
+                1,
+            ),
+            (
+                "Amp-comp method / bench",
+                params.AMP_COMP_COMMANDS,
+                "Speed/accuracy benchmarks.",
+                1,
+                0,
+            ),
+            (
+                "Pitch-interp bench",
+                params.PITCH_INTERP_COMMANDS,
+                "Compares FLOAT / RATIO_Q16 / Q12.",
+                1,
+                1,
+            ),
+            (
+                "Clkdiv methods",
+                params.CLKDIV_HP_COMMANDS,
+                "Speed & accuracy vs GOLD_REF.",
+                2,
+                0,
+            ),
         ]
         if models.active().has_mainboard:
             panel_specs.append(
-                ("Mainboard profiler", params.BENCH_MB_COMMANDS,
-                 "Forwards 45 and 42 to STM32 Mainboard over Serial2.", 2, 1)
+                (
+                    "Mainboard profiler",
+                    params.BENCH_MB_COMMANDS,
+                    "Forwards 45 and 42 to STM32 Mainboard over Serial2.",
+                    2,
+                    1,
+                )
             )
+
+        # MCP4728 DACs panel (Probe: debug 43, Reattach: debug 44)
+        mcp_row, mcp_col = (3, 0) if models.active().has_mainboard else (2, 1)
+        panel_specs.append(
+            (
+                "MCP4728 DACs",
+                params.MCP_DAC_COMMANDS,
+                "Output appears in the Board pane. DCO4 forwards 43/44 to the STM32 "
+                "Mainboard over Serial2. DCO3 runs them when ENABLE_MCP4728 is on.",
+                mcp_row,
+                mcp_col,
+            )
+        )
 
         for title, cmds, note, r, c in panel_specs:
             box = QGroupBox(title)
@@ -638,7 +829,9 @@ class App(QMainWindow):
             cb = QComboBox()
             for label, val in p.choices:
                 cb.addItem(label, val)
-            cb.setCurrentIndex(next((i for i, c in enumerate(p.choices) if c[1] == p.default), 0))
+            cb.setCurrentIndex(
+                next((i for i, c in enumerate(p.choices) if c[1] == p.default), 0)
+            )
             cb.currentIndexChanged.connect(
                 lambda idx, pid=p.pid, cb=cb: self._on_combo_changed(pid, cb.itemData(idx))
             )
@@ -657,7 +850,11 @@ class App(QMainWindow):
                 self._add_cal_run_buttons(row, p)
             else:
                 btn = QPushButton("Send")
-                btn.clicked.connect(lambda _, pid=p.pid, pv=p.pulse_value, l=p.label: self._on_pulse_clicked(pid, pv, l))
+                btn.clicked.connect(
+                    lambda _, pid=p.pid, pv=p.pulse_value, l=p.label: self._on_pulse_clicked(
+                        pid, pv, l
+                    )
+                )
                 row.addWidget(btn)
                 self._pulse_buttons[p.pid] = btn
 
@@ -678,7 +875,9 @@ class App(QMainWindow):
             rd.setFixedWidth(50)
             rd.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             slider.valueChanged.connect(
-                lambda val, bkey=block.key, fkey=f.key, rd=rd: self._on_block_slider_changed(bkey, fkey, val, rd)
+                lambda val, bkey=block.key, fkey=f.key, rd=rd: self._on_block_slider_changed(
+                    bkey, fkey, val, rd
+                )
             )
             row.addWidget(slider, 1)
             row.addWidget(rd)
@@ -688,14 +887,18 @@ class App(QMainWindow):
         parent_layout.addWidget(box)
 
     def _add_manual_cal_stage_row(self, row: QHBoxLayout) -> None:
-        osc_labels = [calstages.osc_label(o) for o in range(models.active().num_oscillators)]
+        osc_labels = [
+            calstages.osc_label(o) for o in range(models.active().num_oscillators)
+        ]
         self._cal_osc_combo = QComboBox()
         self._cal_osc_combo.addItems(osc_labels)
         self._cal_osc_combo.currentIndexChanged.connect(self._manual_cal_on_osc_picked)
         row.addWidget(self._cal_osc_combo)
 
         self._cal_sub_combo = QComboBox()
-        self._cal_sub_combo.currentIndexChanged.connect(self._manual_cal_on_substage_picked)
+        self._cal_sub_combo.currentIndexChanged.connect(
+            self._manual_cal_on_substage_picked
+        )
         row.addWidget(self._cal_sub_combo)
 
         self._cal_stage_readout = QLabel("")
@@ -722,7 +925,9 @@ class App(QMainWindow):
             rb = QRadioButton(name)
             if offset == 0:
                 rb.setChecked(True)
-            rb.toggled.connect(lambda checked, off=offset: self._on_precision_toggled(checked, off))
+            rb.toggled.connect(
+                lambda checked, off=offset: self._on_precision_toggled(checked, off)
+            )
             row.addWidget(rb)
 
     def _add_character_jitter_sliders(self, parent_layout: QVBoxLayout) -> None:
@@ -756,16 +961,16 @@ class App(QMainWindow):
         rd = QLabel(str(params.PIO_PULSE_DEFAULT))
         rd.setObjectName("ReadoutLabel")
         rd.setFixedWidth(60)
-        slider.valueChanged.connect(
-            lambda val, rd=rd: self._on_pio_pulse_changed(val, rd)
-        )
+        slider.valueChanged.connect(lambda val, rd=rd: self._on_pio_pulse_changed(val, rd))
         row.addWidget(slider, 1)
         row.addWidget(rd)
         self.pio_pulse_slider = slider
         self._readouts[("pio_pulse",)] = rd
         parent_layout.addLayout(row)
 
-    def _add_cal_diag_panel(self, parent_layout: QVBoxLayout, title: str, cmds: tuple, note: str) -> None:
+    def _add_cal_diag_panel(
+        self, parent_layout: QVBoxLayout, title: str, cmds: tuple, note: str
+    ) -> None:
         if not cmds:
             return
         box = QGroupBox(title)
@@ -812,7 +1017,9 @@ class App(QMainWindow):
         self.queue_param(pid, value)
         self._manual_cal_on_param_changed(pid, value)
 
-    def _on_block_slider_changed(self, bkey: str, fkey: str, value: int, rd: QLabel) -> None:
+    def _on_block_slider_changed(
+        self, bkey: str, fkey: str, value: int, rd: QLabel
+    ) -> None:
         rd.setText(str(value))
         if self._preset_loading:
             return
@@ -891,7 +1098,11 @@ class App(QMainWindow):
         if self._cal_osc_combo is None:
             return
         osc = self._cal_osc_combo.currentIndex()
-        kind = self._cal_sub_combo.currentData() if self._cal_sub_combo else calstages.KIND_SAW
+        kind = (
+            self._cal_sub_combo.currentData()
+            if self._cal_sub_combo
+            else calstages.KIND_SAW
+        )
         self._manual_cal_fill_substages(osc, kind)
         self._manual_cal_send_stage()
 
@@ -911,7 +1122,11 @@ class App(QMainWindow):
         self._manual_cal_sync_controls()
 
     def _manual_cal_update_stage_readout(self) -> None:
-        if self._cal_stage_readout is None or self._cal_osc_combo is None or self._cal_sub_combo is None:
+        if (
+            self._cal_stage_readout is None
+            or self._cal_osc_combo is None
+            or self._cal_sub_combo is None
+        ):
             return
         osc = self._cal_osc_combo.currentIndex()
         kind = self._cal_sub_combo.currentData()
@@ -926,7 +1141,9 @@ class App(QMainWindow):
         for pid, (lbl, widget) in self._cal_kind_rows.items():
             live = kind in CAL_KIND_PIDS.get(pid, ())
             widget.setEnabled(live)
-            lbl.setStyleSheet("" if live else f"color: {theme.PALETTES[self.mode]['muted']};")
+            lbl.setStyleSheet(
+                "" if live else f"color: {theme.PALETTES[self.mode]['muted']};"
+            )
 
     def _wire_manual_cal_recall(self) -> None:
         self._manual_cal_apply_stage_enables()
@@ -946,7 +1163,9 @@ class App(QMainWindow):
         def pwcenter_done(ok, payload):
             if ok:
                 try:
-                    self._pwcenter_live = list(fileformats.decode_cal_table("PWCenter", payload))
+                    self._pwcenter_live = list(
+                        fileformats.decode_cal_table("PWCenter", payload)
+                    )
                     self._pwcenter_baseline = list(self._pwcenter_live)
                     self._pwcenter_dirty.clear()
                 except ValueError as e:
@@ -957,7 +1176,9 @@ class App(QMainWindow):
         def dutytrim_done(ok, payload):
             if ok:
                 try:
-                    self._dutytrim_live = list(fileformats.decode_cal_table("AmpCompDutyOffset", payload))
+                    self._dutytrim_live = list(
+                        fileformats.decode_cal_table("AmpCompDutyOffset", payload)
+                    )
                     self._dutytrim_baseline = list(self._dutytrim_live)
                     self._dutytrim_dirty.clear()
                 except ValueError as e:
@@ -967,7 +1188,9 @@ class App(QMainWindow):
         def amp440_done(ok, payload):
             if ok:
                 try:
-                    self._amp440_live = list(fileformats.decode_cal_table("AmpComp440", payload))
+                    self._amp440_live = list(
+                        fileformats.decode_cal_table("AmpComp440", payload)
+                    )
                     self._amp440_baseline = list(self._amp440_live)
                     self._amp440_dirty.clear()
                 except ValueError as e:
@@ -977,7 +1200,9 @@ class App(QMainWindow):
         def manual_done(ok, payload):
             if ok:
                 try:
-                    self._manual_cal_live = list(fileformats.decode_cal_table("ManualOffset", payload))
+                    self._manual_cal_live = list(
+                        fileformats.decode_cal_table("ManualOffset", payload)
+                    )
                     self._manual_cal_baseline = list(self._manual_cal_live)
                     self._manual_cal_dirty.clear()
                 except ValueError as e:
@@ -1004,9 +1229,15 @@ class App(QMainWindow):
                     if rd:
                         rd.setText(str(stored))
             if self._dutytrim_live and osc < len(self._dutytrim_live):
-                self._set_widget_value(PID_AMP_COMP_DUTY_OFFSET, self._dutytrim_live[osc])
+                self._set_widget_value(
+                    PID_AMP_COMP_DUTY_OFFSET, self._dutytrim_live[osc]
+                )
             ch = calstages.pw_channel(osc)
-            if self._pwcenter_live and ch < len(self._pwcenter_live) and PID_CAL_PW_CENTER in self.param_widgets:
+            if (
+                self._pwcenter_live
+                and ch < len(self._pwcenter_live)
+                and PID_CAL_PW_CENTER in self.param_widgets
+            ):
                 self._set_widget_value(PID_CAL_PW_CENTER, self._pwcenter_live[ch])
         finally:
             self._manual_cal_syncing = False
@@ -1017,15 +1248,46 @@ class App(QMainWindow):
             return
         osc = self._cal_osc_combo.currentIndex()
         if pid == PID_MANUAL_CAL_OFFSET and self._manual_cal_live:
-            self._track_edit(self._manual_cal_live, self._manual_cal_baseline, self._manual_cal_dirty, osc, value)
+            self._track_edit(
+                self._manual_cal_live,
+                self._manual_cal_baseline,
+                self._manual_cal_dirty,
+                osc,
+                value,
+            )
         elif pid == PID_AMP_COMP_440 and self._amp440_live:
-            self._track_edit(self._amp440_live, self._amp440_baseline, self._amp440_dirty, osc, value)
+            self._track_edit(
+                self._amp440_live,
+                self._amp440_baseline,
+                self._amp440_dirty,
+                osc,
+                value,
+            )
         elif pid == PID_AMP_COMP_DUTY_OFFSET and self._dutytrim_live:
-            self._track_edit(self._dutytrim_live, self._dutytrim_baseline, self._dutytrim_dirty, osc, value)
+            self._track_edit(
+                self._dutytrim_live,
+                self._dutytrim_baseline,
+                self._dutytrim_dirty,
+                osc,
+                value,
+            )
         elif pid == PID_CAL_PW_CENTER and self._pwcenter_live:
-            self._track_edit(self._pwcenter_live, self._pwcenter_baseline, self._pwcenter_dirty, calstages.pw_channel(osc), value)
+            self._track_edit(
+                self._pwcenter_live,
+                self._pwcenter_baseline,
+                self._pwcenter_dirty,
+                calstages.pw_channel(osc),
+                value,
+            )
 
-    def _track_edit(self, live: list[int], baseline: list[int] | None, dirty: set[int], idx: int, val: int) -> None:
+    def _track_edit(
+        self,
+        live: list[int],
+        baseline: list[int] | None,
+        dirty: set[int],
+        idx: int,
+        val: int,
+    ) -> None:
         if idx >= len(live):
             return
         live[idx] = val
@@ -1037,7 +1299,12 @@ class App(QMainWindow):
         self._update_manual_cal_indicator()
 
     def _manual_cal_all_dirty(self) -> bool:
-        return bool(self._manual_cal_dirty or self._amp440_dirty or self._dutytrim_dirty or self._pwcenter_dirty)
+        return bool(
+            self._manual_cal_dirty
+            or self._amp440_dirty
+            or self._dutytrim_dirty
+            or self._pwcenter_dirty
+        )
 
     def _update_manual_cal_indicator(self) -> None:
         if self._manual_cal_indicator is None:
@@ -1047,13 +1314,20 @@ class App(QMainWindow):
                 "Manual cal values: not read from board yet — enable Manual cal mode to recall."
             )
         elif self._manual_cal_all_dirty():
-            names = [f"OSC {calstages.osc_label(o)}" for o in sorted(self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty)]
+            names = [
+                f"OSC {calstages.osc_label(o)}"
+                for o in sorted(
+                    self._manual_cal_dirty | self._amp440_dirty | self._dutytrim_dirty
+                )
+            ]
             names += [f"PW ch {c}" for c in sorted(self._pwcenter_dirty)]
             self._manual_cal_indicator.setText(
                 f"Manual cal values: unsaved changes for {', '.join(names)} — press Store before autotuning."
             )
         else:
-            self._manual_cal_indicator.setText("Manual cal values: matches what is stored on the board.")
+            self._manual_cal_indicator.setText(
+                "Manual cal values: matches what is stored on the board."
+            )
 
     def _manual_cal_on_stored(self) -> None:
         if self._manual_cal_live:
@@ -1077,7 +1351,9 @@ class App(QMainWindow):
             self,
             "Unsaved Manual Calibration Values",
             "You have unsaved manual calibration values. Auto calibration will reload LittleFS and discard them.",
-            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
         )
         if res == QMessageBox.StandardButton.Cancel:
             return False
@@ -1104,7 +1380,9 @@ class App(QMainWindow):
                 return 1 if w.isChecked() else 0
             return p.default
 
-        slot = presets.defaults_slot(name or self.preset_name_entry.text().strip() or "Untitled")
+        slot = presets.defaults_slot(
+            name or self.preset_name_entry.text().strip() or "Untitled"
+        )
         for p in presets.patch_params():
             slot["params"][str(p.pid)] = get_val(p)
         for b in presets.patch_blocks():
@@ -1120,7 +1398,9 @@ class App(QMainWindow):
         fp = presets.slot_fingerprint(self._current_ui_slot())
         self.preset_dirty_label.setText("*" if fp != self._clean_fp else "")
 
-    def _preset_recall(self, index: int, *, send: bool, persist_current: bool) -> None:
+    def _preset_recall(
+        self, index: int, *, send: bool, persist_current: bool
+    ) -> None:
         index = max(0, min(presets.NUM_SLOTS - 1, index))
         slot = self.bank["slots"][index]
         empty = presets.slot_is_empty(slot)
@@ -1129,7 +1409,9 @@ class App(QMainWindow):
             self._apply_slot_dict(None if empty else slot)
             name = "Init" if empty else slot["name"]
             self.preset_name_entry.setText(name)
-            self._clean_fp = presets.slot_fingerprint(presets.defaults_slot() if empty else slot)
+            self._clean_fp = presets.slot_fingerprint(
+                presets.defaults_slot() if empty else slot
+            )
             self.preset_spin.blockSignals(True)
             self.preset_spin.setValue(index)
             self.preset_spin.blockSignals(False)
@@ -1144,7 +1426,11 @@ class App(QMainWindow):
             self.send_all()
 
     def _apply_slot_dict(self, slot: dict | None) -> None:
-        data = presets.defaults_slot() if presets.slot_is_empty(slot) else slot  # type: ignore[arg-type]
+        data = (
+            presets.defaults_slot()
+            if presets.slot_is_empty(slot)
+            else slot  # type: ignore[arg-type]
+        )
         for p in presets.patch_params():
             val = int(data["params"].get(str(p.pid), p.default))
             self._set_widget_value(p.pid, val)
@@ -1204,10 +1490,19 @@ class App(QMainWindow):
             self._browser.refresh()
 
     def _preset_save_as(self) -> None:
-        idx, ok = QInputDialog.getInt(self, "Save as…", "Slot (0–255):", self.preset_spin.value(), 0, presets.NUM_SLOTS - 1)
+        idx, ok = QInputDialog.getInt(
+            self,
+            "Save as…",
+            "Slot (0–255):",
+            self.preset_spin.value(),
+            0,
+            presets.NUM_SLOTS - 1,
+        )
         if not ok:
             return
-        name, ok = QInputDialog.getText(self, "Save as…", "Preset name:", text=self.preset_name_entry.text())
+        name, ok = QInputDialog.getText(
+            self, "Save as…", "Preset name:", text=self.preset_name_entry.text()
+        )
         if not ok:
             return
         self.preset_name_entry.setText(name.strip() or "Untitled")
@@ -1237,7 +1532,9 @@ class App(QMainWindow):
 
     def _export_patch_file(self) -> None:
         slot = self._current_ui_slot()
-        path, _ = QFileDialog.getSaveFileName(self, "Export Patch", f"{slot['name']}.json", "JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Patch", f"{slot['name']}.json", "JSON (*.json)"
+        )
         if path:
             fileformats.save_patch_file(path, slot)
             self.log(f"[ui] exported patch to {path}\n")
@@ -1258,7 +1555,9 @@ class App(QMainWindow):
             self.log(f"[ui] imported patch from {path}\n")
 
     def _export_bank_file(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Export Bank", "dco_bank.json", "JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Bank", "dco_bank.json", "JSON (*.json)"
+        )
         if path:
             fileformats.save_bank_file(path, self.bank)
             self.log(f"[ui] exported bank to {path}\n")
@@ -1268,7 +1567,9 @@ class App(QMainWindow):
         if path:
             self.bank = fileformats.load_bank_file(path)
             presets.save_bank(self.bank)
-            self._preset_recall(int(self.bank["current"]), send=True, persist_current=False)
+            self._preset_recall(
+                int(self.bank["current"]), send=True, persist_current=False
+            )
             if self._browser:
                 self._browser.refresh()
             self.log(f"[ui] imported bank from {path}\n")
@@ -1281,7 +1582,12 @@ class App(QMainWindow):
 
         def step(k: int):
             if k >= len(names):
-                path, _ = QFileDialog.getSaveFileName(self, "Save Calibration Dump", "dco_calibration.json", "JSON (*.json)")
+                path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Save Calibration Dump",
+                    "dco_calibration.json",
+                    "JSON (*.json)",
+                )
                 if path:
                     fileformats.save_cal_file(path, results)
                     self.log(f"[mcu] saved cal dump to {path}\n")
@@ -1301,7 +1607,9 @@ class App(QMainWindow):
     def _cal_load_from_file(self) -> None:
         if not self._mcu_ready():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Load Calibration File", "", "JSON (*.json)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Calibration File", "", "JSON (*.json)"
+        )
         if not path:
             return
         tables = fileformats.load_cal_file(path)
@@ -1343,7 +1651,9 @@ class App(QMainWindow):
             self.link.close()
             self.connect_btn.setText("Connect")
             self.status_label.setText("not connected")
-            self.status_dot.setStyleSheet(f"color: {theme.PALETTES[self.mode]['off']};")
+            self.status_dot.setStyleSheet(
+                f"color: {theme.PALETTES[self.mode]['off']}; font-size: 14px;"
+            )
             self.log("[link] disconnected\n")
             return
 
@@ -1358,7 +1668,9 @@ class App(QMainWindow):
             return
         self.connect_btn.setText("Disconnect")
         self.status_label.setText(f"connected: {device}")
-        self.status_dot.setStyleSheet(f"color: {theme.PALETTES[self.mode]['ok']};")
+        self.status_dot.setStyleSheet(
+            f"color: {theme.PALETTES[self.mode]['ok']}; font-size: 14px;"
+        )
         self.log(f"[link] connected to {device}\n")
         self.send_all()
 
@@ -1401,7 +1713,9 @@ class App(QMainWindow):
         self.pending[f"p{pid}"] = protocol.stuff(protocol.param16(pid, int(val)))
 
     def queue_debug_u16(self, val: int) -> None:
-        self.pending["p_debug_u16"] = protocol.stuff(protocol.param16u(params.DEBUG_PARAM_ID, int(val)))
+        self.pending["p_debug_u16"] = protocol.stuff(
+            protocol.param16u(params.DEBUG_PARAM_ID, int(val))
+        )
 
     def queue_block(self, key: str) -> None:
         block = self.blocks_by_key[key]
@@ -1445,7 +1759,11 @@ class App(QMainWindow):
         self._flush()
         if screen:
             self.send_now(protocol.preset_name(self.preset_name_entry.text()))
-            self.send_now(protocol.param16(protocol.PARAM_UI_PRESET_SCROLL, self.preset_spin.value()))
+            self.send_now(
+                protocol.param16(
+                    protocol.PARAM_UI_PRESET_SCROLL, self.preset_spin.value()
+                )
+            )
             n += 2
         self.log(f"[send] patch {n} frames\n")
         return n
@@ -1468,8 +1786,12 @@ class PresetBrowser(QDialog):
         lay = QVBoxLayout(self)
         self.table = QTableWidget(presets.NUM_SLOTS, 3)
         self.table.setHorizontalHeaderLabels(["Slot", "Local Name", "Board Name"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.cellDoubleClicked.connect(lambda: self._local_load())
         lay.addWidget(self.table)
@@ -1557,7 +1879,9 @@ class PresetBrowser(QDialog):
         slot = self.app.bank["slots"][idx]
         if not presets.slot_is_empty(slot) and self.app._mcu_ready():
             rec = fileformats.slot_to_record(slot)
-            self.app.mcu.push_preset_record(idx, rec, lambda ok, _: self._mcu_refresh_dir())
+            self.app.mcu.push_preset_record(
+                idx, rec, lambda ok, _: self._mcu_refresh_dir()
+            )
 
     def _mcu_fetch_slot(self) -> None:
         idx = self._selected_row()
@@ -1574,7 +1898,11 @@ class PresetBrowser(QDialog):
             self.refresh()
 
     def _mcu_push_all(self) -> None:
-        entries = [(i, s) for i, s in enumerate(self.app.bank["slots"]) if not presets.slot_is_empty(s)]
+        entries = [
+            (i, s)
+            for i, s in enumerate(self.app.bank["slots"])
+            if not presets.slot_is_empty(s)
+        ]
         if not entries or not self.app._mcu_ready():
             return
 
@@ -1583,7 +1911,9 @@ class PresetBrowser(QDialog):
                 self._mcu_refresh_dir()
                 return
             i, slot = entries[k]
-            self.app.mcu.push_preset_record(i, fileformats.slot_to_record(slot), lambda ok, _: step(k + 1))
+            self.app.mcu.push_preset_record(
+                i, fileformats.slot_to_record(slot), lambda ok, _: step(k + 1)
+            )
 
         step(0)
 
@@ -1603,7 +1933,8 @@ class PresetBrowser(QDialog):
                     return
                 i = slots[k]
                 self.app.mcu.dump_preset_slot(
-                    i, lambda ok, p: self._on_pulled_step(i, ok, p, lambda: step(k + 1))
+                    i,
+                    lambda ok, p: self._on_pulled_step(i, ok, p, lambda: step(k + 1)),
                 )
 
             step(0)
@@ -1623,21 +1954,38 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="DCO Bench Controller (PySide6)")
     ap.add_argument("--port", help="serial device (e.g. /dev/ttyACM0)")
     ap.add_argument("--model", choices=sorted(models.PROFILES))
-    ap.add_argument("--theme", choices=theme.PALETTES.keys(), default="dark")
+    ap.add_argument(
+        "--theme",
+        choices=sorted(theme.PALETTES.keys()),
+        default=theme.DEFAULT_THEME,
+        help=f"Color theme (default: {theme.DEFAULT_THEME}, choices: {', '.join(theme.PALETTES.keys())})",
+    )
+    ap.add_argument(
+        "--font-size",
+        type=int,
+        default=12,
+        help="Base font size in pt/px (default: 12)",
+    )
     ap.add_argument("--cobs", action="store_true")
     args = ap.parse_args()
 
-    env_cobs = os.environ.get("DCO_SERIAL_COBS", "").strip().lower() in ("1", "true", "yes")
+    env_cobs = (
+        os.environ.get("DCO_SERIAL_COBS", "").strip().lower() in ("1", "true", "yes")
+    )
     cobs = args.cobs or env_cobs
 
     env_model = os.environ.get("DCO_CONTROL_MODEL", "").strip().lower()
-    model = args.model or models.detect() or (env_model if env_model in models.PROFILES else None)
+    model = (
+        args.model
+        or models.detect()
+        or (env_model if env_model in models.PROFILES else None)
+    )
     if model:
         models.set_active(model)
     apply_active_model()
 
     q_app = QApplication(sys.argv)
-    window = App(args.port, mode=args.theme, cobs=cobs)
+    window = App(args.port, mode=args.theme, base_font_size=args.font_size, cobs=cobs)
     window.show()
     sys.exit(q_app.exec())
 
