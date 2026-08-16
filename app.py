@@ -1742,6 +1742,13 @@ class App(QMainWindow):
         if screen:
             self.send_now(protocol.screen_signal(protocol.SCREEN_SIGNAL_SILENT))
             n += 1
+            self.send_now(protocol.preset_name(self.preset_name_entry.text()))
+            self.send_now(
+                protocol.param16(
+                    protocol.PARAM_UI_PRESET_SCROLL, self.preset_spin.value()
+                )
+            )
+            n += 2            
         for p in presets.patch_params():
             w = self.param_widgets.get(p.pid)
             val = p.default
@@ -1757,14 +1764,6 @@ class App(QMainWindow):
             self.queue_block(block.key)
             n += 1
         self._flush()
-        if screen:
-            self.send_now(protocol.preset_name(self.preset_name_entry.text()))
-            self.send_now(
-                protocol.param16(
-                    protocol.PARAM_UI_PRESET_SCROLL, self.preset_spin.value()
-                )
-            )
-            n += 2
         self.log(f"[send] patch {n} frames\n")
         return n
 
