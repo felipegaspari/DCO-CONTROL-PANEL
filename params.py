@@ -580,6 +580,8 @@ DEBUG_COMMANDS = (
     ("Mem diag polls on", 15),
     ("Note retrig: EXACT_Y", 26),
     ("Note retrig: SYNC_JMP", 27),
+    ("Reboot MCU", 90),
+    ("Reboot to BOOTSEL", 91),
 )
 
 # PARAM_DEBUG_COMMAND (160). Needs RUNNING_AVERAGE in the firmware; otherwise no-ops.
