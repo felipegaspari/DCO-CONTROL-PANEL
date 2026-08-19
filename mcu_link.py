@@ -30,14 +30,15 @@ def cal_tables() -> dict[str, tuple[int, int, int]]:
     Sizes mirror the active model's DCO/FS.h (models.ModelProfile), so this is
     looked up per call rather than baked in at import time.
     """
+
+    """Calibration table name → (PARAM_CAL_DUMP selector, bulk target, size)."""
     m = models.active()
     return {
-        "voiceTables": (1, protocol.BULK_TARGET_VOICE_TABLES, m.voice_tables_size),
-        "PWCenter": (2, protocol.BULK_TARGET_PW_CENTER, m.pw_bank_size),
-        "PWHighLimit": (3, protocol.BULK_TARGET_PW_HIGH_LIMIT, m.pw_bank_size),
-        "PWLowLimit": (4, protocol.BULK_TARGET_PW_LOW_LIMIT, m.pw_bank_size),
-        "ManualOffset": (5, protocol.BULK_TARGET_MANUAL_OFFSET, m.manual_offset_size),
-        "AmpComp440": (6, protocol.BULK_TARGET_AMP_COMP_440, m.amp_comp_440_size),
+        "voiceTables":       (1, protocol.BULK_TARGET_VOICE_TABLES, m.voice_tables_size),
+        "PWCal3Pt":          (2, protocol.BULK_TARGET_PW_3PT, m.pw_bank_size),
+        "AmpCompTopPair":    (3, protocol.BULK_TARGET_AMP_COMP_TOP_PAIR, m.amp_comp_top_pair_size),
+        "ManualOffset":      (5, protocol.BULK_TARGET_MANUAL_OFFSET, m.manual_offset_size),
+        "AmpComp440":        (6, protocol.BULK_TARGET_AMP_COMP_440, m.amp_comp_440_size),
         "AmpCompDutyOffset": (7, protocol.BULK_TARGET_AMP_COMP_DUTY, m.amp_comp_duty_size),
     }
 

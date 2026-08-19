@@ -197,13 +197,12 @@ AMP_COMP_PAIRS = models.AMP_COMP_PAIRS
 
 # JSON key → LittleFS/dump table name.
 CAL_JSON_KEYS: dict[str, str] = {
-    "amp_comp": "voiceTables",
-    "pw_center": "PWCenter",
-    "pw_high_limit": "PWHighLimit",
-    "pw_low_limit": "PWLowLimit",
-    "manual_offset": "ManualOffset",
-    "amp_comp_440": "AmpComp440",
-    "amp_comp_duty": "AmpCompDutyOffset",
+    "amp_comp":           "voiceTables",
+    "pw_3pt":             "PWCal3Pt",
+    "amp_comp_top_pair":  "AmpCompTopPair",
+    "manual_offset":      "ManualOffset",
+    "amp_comp_440":       "AmpComp440",
+    "amp_comp_duty":      "AmpCompDutyOffset",
 }
 
 
@@ -230,7 +229,6 @@ def _clamp_cal_bytes(name: str, data: bytes, expected: int) -> bytes:
     )
     return data[:expected]
 
-
 def decode_cal_table(name: str, data: bytes) -> Any:
     """Binary table → JSON-friendly numbers (sizes from the active model)."""
     m = models.active()
@@ -245,9 +243,30 @@ def decode_cal_table(name: str, data: bytes) -> Any:
                 pairs.append([freq, pwm])
             out.append(pairs)
         return out
-    if name in ("PWCenter", "PWHighLimit", "PWLowLimit"):
+
+    # 3-Point PW Decoder (3 points x 6 bytes = 18 bytes / channel)
+    if name == "PWCal3Pt":
         data = _clamp_cal_bytes(name, data, m.pw_bank_size)
-        return list(struct.unpack(f"<{m.num_pw_channels}H", data))
+        channels = []
+        point_labels = ("low", "mid_440", "high")
+        for ch in range(m.num_pw_channels):
+            pts = []
+            for pt in range(3):
+                base = (ch * 3 + pt) * 6
+                center, low, high = struct.unpack_from("<HHH", data, base)
+                pts.append({
+                    "point": point_labels[pt],
+                    "center": center,
+                    "low_limit": low,
+                    "high_limit": high,
+                })
+            channels.append(pts)
+        return channels
+
+    if name == "AmpCompTopPair":
+        data = _clamp_cal_bytes(name, data, m.amp_comp_top_pair_size)
+        return list(struct.unpack(f"<{m.num_oscillators}B", data))
+
     if name == "ManualOffset":
         data = _clamp_cal_bytes(name, data, m.manual_offset_size)
         return list(struct.unpack(f"<{m.num_oscillators}b", data))
@@ -273,29 +292,43 @@ def encode_cal_table(name: str, value: Any) -> bytes:
             for freq, pwm in osc:
                 buf += struct.pack("<II", int(freq) & 0xFFFFFFFF, int(pwm) & 0xFFFFFFFF)
         return bytes(buf)
-    if name in ("PWCenter", "PWHighLimit", "PWLowLimit"):
+
+    # 3-Point PW Encoder (6 bytes per point, 18 bytes per channel)
+    if name == "PWCal3Pt":
         if len(value) != m.num_pw_channels:
-            raise ValueError(f"{name} needs {m.num_pw_channels} values")
-        return struct.pack(f"<{m.num_pw_channels}H",
-                           *(max(0, min(0xFFFF, int(v))) for v in value))
+            raise ValueError(f"PWCal3Pt needs {m.num_pw_channels} channels")
+        buf = bytearray()
+        for ch_pts in value:
+            if len(ch_pts) != 3:
+                raise ValueError("Each PW channel must contain exactly 3 points (low, mid, high)")
+            for pt in ch_pts:
+                if isinstance(pt, dict):
+                    c = int(pt.get("center", 0))
+                    l = int(pt.get("low_limit", 0))
+                    h = int(pt.get("high_limit", 0))
+                else:
+                    c, l, h = pt
+                buf += struct.pack("<HHH", c & 0xFFFF, l & 0xFFFF, h & 0xFFFF)
+        return bytes(buf)
+
+    if name == "AmpCompTopPair":
+        if len(value) != m.num_oscillators:
+            raise ValueError(f"AmpCompTopPair needs {m.num_oscillators} values")
+        return struct.pack(f"<{m.num_oscillators}B", *(max(0, min(255, int(v))) for v in value))
+
     if name == "ManualOffset":
         if len(value) != m.num_oscillators:
             raise ValueError(f"ManualOffset needs {m.num_oscillators} values")
-        return struct.pack(f"<{m.num_oscillators}b",
-                           *(max(-128, min(127, int(v))) for v in value))
+        return struct.pack(f"<{m.num_oscillators}b", *(max(-128, min(127, int(v))) for v in value))
     if name == "AmpComp440":
         if len(value) != m.num_oscillators:
             raise ValueError(f"AmpComp440 needs {m.num_oscillators} values")
-        return struct.pack(f"<{m.num_oscillators}H",
-                           *(max(0, min(0xFFFF, int(v))) for v in value))
+        return struct.pack(f"<{m.num_oscillators}H", *(max(0, min(0xFFFF, int(v))) for v in value))
     if name == "AmpCompDutyOffset":
         if len(value) != m.num_oscillators:
             raise ValueError(f"AmpCompDutyOffset needs {m.num_oscillators} values")
-        return struct.pack(f"<{m.num_oscillators}h",
-                           *(max(-32768, min(32767, int(v))) for v in value))
+        return struct.pack(f"<{m.num_oscillators}h", *(max(-32768, min(32767, int(v))) for v in value))
     raise ValueError(f"unknown calibration table {name}")
-
-
 def save_cal_file(path: str | Path, tables: dict[str, bytes]) -> None:
     """Write dumped binary tables (by LittleFS name) as a <model>-cal JSON file."""
     m = models.active()

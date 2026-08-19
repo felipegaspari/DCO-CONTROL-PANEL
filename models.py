@@ -59,9 +59,15 @@ class ModelProfile:
     def voice_tables_size(self) -> int:
         return self.num_oscillators * AMP_COMP_PAIRS * 8
 
+    # 3 points x 6 bytes [center: u16, lowLimit: u16, highLimit: u16] = 18 bytes per channel
     @property
     def pw_bank_size(self) -> int:
-        return self.num_pw_channels * 2
+        return self.num_pw_channels * 18
+
+    # 1 byte per oscillator
+    @property
+    def amp_comp_top_pair_size(self) -> int:
+        return self.num_oscillators
 
     @property
     def manual_offset_size(self) -> int:
@@ -74,7 +80,6 @@ class ModelProfile:
     @property
     def amp_comp_duty_size(self) -> int:
         return self.num_oscillators * 2
-
 
 DCO3 = ModelProfile(
     key="dco3",

@@ -1156,20 +1156,23 @@ class App(QMainWindow):
             return
         self._manual_cal_refresh_from_board()
 
+
+# In app.py inside class App:
+
     def _manual_cal_refresh_from_board(self) -> None:
         if not self._mcu_ready():
             return
 
-        def pwcenter_done(ok, payload):
+        def pwcal_done(ok, payload):
             if ok:
                 try:
-                    self._pwcenter_live = list(
-                        fileformats.decode_cal_table("PWCenter", payload)
-                    )
+                    channels = fileformats.decode_cal_table("PWCal3Pt", payload)
+                    # Extract Point 1 (Mid / 440 Hz anchor) center for live UI slider
+                    self._pwcenter_live = [int(ch[1]["center"]) for ch in channels]
                     self._pwcenter_baseline = list(self._pwcenter_live)
                     self._pwcenter_dirty.clear()
-                except ValueError as e:
-                    self.log(f"[mcu] PW center recall err: {e}\n")
+                except (ValueError, KeyError, IndexError) as e:
+                    self.log(f"[mcu] PW 3-point recall err: {e}\n")
             self._manual_cal_sync_controls()
             self._update_manual_cal_indicator()
 
@@ -1183,7 +1186,7 @@ class App(QMainWindow):
                     self._dutytrim_dirty.clear()
                 except ValueError as e:
                     self.log(f"[mcu] duty trim recall err: {e}\n")
-            self.mcu.dump_cal_table("PWCenter", pwcenter_done)
+            self.mcu.dump_cal_table("PWCal3Pt", pwcal_done)
 
         def amp440_done(ok, payload):
             if ok:
@@ -1210,6 +1213,61 @@ class App(QMainWindow):
             self.mcu.dump_cal_table("AmpComp440", amp440_done)
 
         self.mcu.dump_cal_table("ManualOffset", manual_done)
+        if not self._mcu_ready():
+            return
+
+        def pwcal_done(ok, payload):
+            if ok:
+                try:
+                    channels = fileformats.decode_cal_table("PWCal3Pt", payload)
+                    # Extract Point 1 (Mid / 440 Hz anchor) center for live UI slider
+                    self._pwcenter_live = [int(ch[1]["center"]) for ch in channels]
+                    self._pwcenter_baseline = list(self._pwcenter_live)
+                    self._pwcenter_dirty.clear()
+                except (ValueError, KeyError, IndexError) as e:
+                    self.log(f"[mcu] PW 3-point recall err: {e}\n")
+            self._manual_cal_sync_controls()
+            self._update_manual_cal_indicator()
+
+        def dutytrim_done(ok, payload):
+            if ok:
+                try:
+                    self._dutytrim_live = list(
+                        fileformats.decode_cal_table("AmpCompDutyOffset", payload)
+                    )
+                    self._dutytrim_baseline = list(self._dutytrim_live)
+                    self._dutytrim_dirty.clear()
+                except ValueError as e:
+                    self.log(f"[mcu] duty trim recall err: {e}\n")
+            self.mcu.dump_cal_table("PWCal3Pt", pwcal_done)
+
+        def amp440_done(ok, payload):
+            if ok:
+                try:
+                    self._amp440_live = list(
+                        fileformats.decode_cal_table("AmpComp440", payload)
+                    )
+                    self._amp440_baseline = list(self._amp440_live)
+                    self._amp440_dirty.clear()
+                except ValueError as e:
+                    self.log(f"[mcu] amp comp 440 err: {e}\n")
+            self.mcu.dump_cal_table("AmpCompDutyOffset", dutytrim_done)
+
+        def manual_done(ok, payload):
+            if ok:
+                try:
+                    self._manual_cal_live = list(
+                        fileformats.decode_cal_table("ManualOffset", payload)
+                    )
+                    self._manual_cal_baseline = list(self._manual_cal_live)
+                    self._manual_cal_dirty.clear()
+                except ValueError as e:
+                    self.log(f"[mcu] manual offset err: {e}\n")
+            self.mcu.dump_cal_table("AmpComp440", amp440_done)
+
+        self.mcu.dump_cal_table("ManualOffset", manual_done)
+        if not self._mcu_ready():
+            return
 
     def _manual_cal_sync_controls(self) -> None:
         if self._cal_osc_combo is None:
