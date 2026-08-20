@@ -45,6 +45,7 @@ import calstages
 import fileformats
 import mcu_link
 import models
+import param_meta
 import params
 import presets
 import protocol
@@ -59,23 +60,24 @@ SEND_INTERVAL_MS = 20
 PARAM_BY_PID = {p.pid: p for p in params.PARAMS}
 
 # Layout constants
-OSC_PITCH_PIDS = (13, 14, 33, 15, 34)
-OSC_SYNC_PIDS = (31, 36, 37, 17)
-OSC_VOICE_PIDS = (26, 102, 27, 18, 32, 28, 29, 30, 43, 21)
-OSC_LEVEL_PIDS = (22, 23, 38, 24)
+# Layout constants in app.py
+OSC_PITCH_PIDS = (13, 14, 34, 15, 35)
+OSC_SYNC_PIDS = (32, 37, 38, 17)
+OSC_VOICE_PIDS = (26, 27, 28, 18, 33, 29, 30, 31, 43, 21)
+OSC_LEVEL_PIDS = (22, 23, 39, 24)
 OSC_WAVE_MATRIX = [
     ("OSC1", (1, 2, 3)),
-    ("OSC2", (84, 85, 86)),
-    ("OSC3", (87, 88, 89)),
+    ("OSC2", (87, 88, 89)),
+    ("OSC3", (90, 91, 92)),
 ]
 OSC_WAVE_COLS = ("Saw", "Pulse", "Tri")
 
 ENV_ADSR_BLOCKS = ("adsr_vca", "adsr_vcf", "adsr_dco")
-ENV_CURVE_RESTART_PIDS = (8, 9, 48, 49, 50, 51)
+ENV_CURVE_RESTART_PIDS = (8, 9, 214, 48, 49, 51, 52, 54, 55)
 ENV_CURVE_COLUMNS = (
     ("EnvVCA curves", 48, 49, 8),
-    ("EnvVCF curves", 50, 51, 9),
-    ("EnvDCO curves", None, None, None),
+    ("EnvVCF curves", 51, 52, 9),
+    ("EnvDCO curves", 54, 55, 214),
 )
 
 PID_RUN_AUTOTUNE = 150
@@ -1011,7 +1013,7 @@ class App(QMainWindow):
     # --- Interaction Handlers ---
 
     def _on_slider_changed(self, pid: int, value: int, rd: QLabel) -> None:
-        rd.setText(str(value))
+        rd.setText(param_meta.format_display_value(pid, value))
         if self._preset_loading:
             return
         self.queue_param(pid, value)
@@ -1508,7 +1510,7 @@ class App(QMainWindow):
             w.setValue(val)
             rd = self._readouts.get(("p", pid))
             if rd:
-                rd.setText(str(val))
+                rd.setText(param_meta.format_display_value(pid, val))
         elif isinstance(w, QComboBox):
             idx = w.findData(val)
             if idx != -1:

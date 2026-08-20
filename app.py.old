@@ -1939,7 +1939,7 @@ class App:
              "Output appears in the log below. Period probes only hold while no note "
              "is playing. Dump RAM (13) prints heap + per-core stack (needs ENABLE_MEM_DIAG). "
              "14/15 disable/enable mem_diag loop polls (A/B vs profiler). "
-             "Note retrig 26/27 A/B EXACT_Y vs SYNC_JMP (needs oscSync ≥ 1); "
+             "Note retrig 26/27 A/B EXACT_Y vs SYNC_JMP (needs oscPhaseSync ≥ 1); "
              "Board ack note_retrig=… when RUNNING_AVERAGE.", 0, 0),
             ("Hot-path profiler", params.BENCH_COMMANDS,
              "Needs RUNNING_AVERAGE in the firmware (otherwise these are no-ops). "

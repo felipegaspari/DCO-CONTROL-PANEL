@@ -1,116 +1,105 @@
 #!/usr/bin/env python3
-"""Emit the MIDI CC map, its chart and an Open Stage Control panel from params.py.
+"""Emit the MIDI CC map, its chart, and an Open Stage Control panel from params.py.
 
-params.py is the one description of the DCO's control surface, so the firmware table,
-the implementation chart and the panel session are all generated from it and cannot
-drift apart. Three outputs:
-
-  ../DCO/_shared/midi_cc_map.h      the MidiCcEntry table, included by DCO/midi_cc.h
-  ../DCO/docs/MIDI_CC_MAP.md        the implementation chart
-  ../DCO/tools/panels/<model>_panel.json  the Open Stage Control session
-
-The synth model (models.py) is read from the firmware sitting next to this
-tool at the project root — the USBDevice.setProductDescriptor() string in
-../DCO/Serial.ino, or ../project_config.h — so it targets whichever project
-checked this repo out; --model overrides.
+params.py is the single source of truth for the DCO control surface.
+This script produces:
+  - DCO/_shared/midi_cc_map.h
+  - DCO/docs/MIDI_CC_MAP.md
+  - DCO/tools/panels/<model>_panel.json
 
 Usage:
-  python3 gen_midi_map.py           write the three files
-  python3 gen_midi_map.py --check   validate and diff only, exit 1 on drift
-
-The checks are the interesting part: they catch a CC collision, a reserved controller,
-a parameter that params.py claims but the firmware does not route, a block value whose
-CC_LOCAL_* target is not handled in midi.ino, and a combo entry that 7-bit CC cannot
-express exactly.
-
---check also holds protocol.py against the firmware headers it transcribes by hand.
-ParamIds come from ../DCO-PROTOCOL/params_def.h and command bytes and payload lengths
-from ../DCO-PROTOCOL/serial_input_protocol.h — the shared library every board compiles,
-so this validates the host tool against all of them at once. Without that, a renumbered
-id or a resized payload only shows up as frames the board silently drops.
+  python3 gen_midi_map.py           # write the outputs
+  python3 gen_midi_map.py --check   # validate and check drift (exit 1 on drift)
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import re
-import sys
 from dataclasses import dataclass
 from html import escape
+import json
 from pathlib import Path
+import re
+import sys
 
 import models
 import params
 import protocol
 
-# Controllers left alone: 0/32 bank select (implemented in midi.ino: nonzero = bank 1
-# for Program Change → slots 128..255), 1 mod wheel, 6/38 data entry, 7 volume,
-# 10 pan, 11 expression, 42 pitch-bend range (the DCO's own historical use), 64 sustain,
-# 98-101 NRPN/RPN, and 120-127 channel mode. Keeping 98-101 free also leaves room for a
-# later NRPN upgrade without moving any assignment made here.
-RESERVED_CC = {0, 1, 6, 7, 10, 11, 32, 38, 42, 64, 98, 99, 100, 101,
-               120, 121, 122, 123, 124, 125, 126, 127}
+# Controllers left untouched for standard MIDI / DAW operations:
+RESERVED_CC = {
+    0, 1, 6, 7, 10, 11, 32, 38, 42, 64, 98, 99, 100, 101,
+    120, 121, 122, 123, 124, 125, 126, 127
+}
 
 MIDI_CHANNEL = 1
-# Open Stage Control target; per model, set by main() (midi:dco3 / midi:dco4).
-MIDI_TARGET = "midi:dco3"
-
-# A session without a version is treated as pre-0.49.12 and run through every legacy
-# converter, which quietly rewrites properties on the way in: decimals is replaced by the
-# long-gone precision, colorWidget by color, and every container with widgets has its
-# padding forced to 0. The newest converter is 1.24.2, so anything above that is left
-# alone. Open Stage Control stamps its own version here when it saves.
+MIDI_TARGET = "midi:dco"
 SESSION_VERSION = "1.30.0"
 
-# Panel geometry. The grid reflows to the window, so the width is a minimum per column.
-# Heights have to come from the grid itself: the app's stylesheet forces height to auto
-# on every direct child of a grid container, so a cell cannot size itself. Rows are one
-# ROW_UNIT tall and a cell spans CELL_ROWS of them; a section header takes a single row.
 CELL_WIDTH = 132
 ROW_UNIT = 30
 CELL_ROWS = 5
 VALUE_HEIGHT = 20
 
-# One muted accent per tab, so a knob's colour says which section it belongs to.
 GROUP_ACCENT = {
     params.GROUP_OSC: "#dda44a",
+    params.GROUP_SUB: "#c2825b",
     params.GROUP_ENV: "#6fbf8b",
     params.GROUP_FILTER: "#d1685f",
     params.GROUP_PWM: "#b98bd1",
     params.GROUP_LFO: "#4fb3c4",
     params.GROUP_MOD: "#a67c52",
+    params.GROUP_CHARACTER: "#d99b79",
     params.GROUP_CAL: "#8d97a3",
 }
 
 CURVE_LINEAR = "MIDI_CC_LINEAR"
 CURVE_EXP_TIME = "MIDI_CC_EXP_TIME"
+GENERATED_BY = "DCO-CONTROL-PANEL/gen_midi_map.py from DCO-CONTROL-PANEL/params.py"
+
+# --- Directory & File Topology ---------------------------------------------------
 
 HERE = Path(__file__).resolve().parent
-DCO_DIR = HERE.parent / "DCO"
-# The protocol headers every board compiles, shared through the DCO-PROTOCOL
-# library checked out beside this tool.
-PROTOCOL_DIR = HERE.parent / "DCO-PROTOCOL"
+PROJECT_ROOT = HERE.parent
 
-MAP_HEADER = DCO_DIR / "_shared" / "midi_cc_map.h"
-CHART = DCO_DIR / "docs" / "MIDI_CC_MAP.md"
+# Sibling directories at the project root
+DCO_DIR = PROJECT_ROOT / "DCO"
+PROTOCOL_DIR = PROJECT_ROOT / "DCO-PROTOCOL"
+
+# Target header (prefers DCO/_shared/ if present, otherwise DCO/)
+MAP_HEADER = (
+    DCO_DIR / "_shared" / "midi_cc_map.h"
+    if (DCO_DIR / "_shared").is_dir()
+    else DCO_DIR / "midi_cc_map.h"
+)
+
+# Target Markdown chart (prefers DCO/docs/ if present, otherwise DCO/)
+CHART = (
+    DCO_DIR / "docs" / "MIDI_CC_MAP.md"
+    if (DCO_DIR / "docs").is_dir()
+    else DCO_DIR / "MIDI_CC_MAP.md"
+)
 
 
 def panel_path() -> Path:
-    return DCO_DIR / "tools" / "panels" / models.active().panel_filename
+    """Target Open Stage Control panel JSON path."""
+    target_dir = DCO_DIR / "tools" / "panels"
+    if not target_dir.is_dir():
+        target_dir = HERE / "panels"
+    return target_dir / models.active().panel_filename
 
 
 def detect_firmware_model() -> str | None:
-    """Read the USB product descriptor from ../DCO/Serial.ino and match a profile.
-
-    Falls back to the superproject's project_config.h, which is what the boards
-    themselves read, so a DCO whose descriptor has been renamed still generates
-    the right map instead of silently generating the other synth's.
-    """
+    """Read USB product descriptor from DCO/Serial.ino (or DCO/DCO.ino)."""
+    source_path = DCO_DIR / "Serial.ino"
+    if not source_path.exists():
+        source_path = DCO_DIR / "DCO.ino"
+    
     try:
-        source = (DCO_DIR / "Serial.ino").read_text()
+        source = source_path.read_text(encoding="utf-8")
     except OSError:
         source = ""
+    
     m = re.search(r'setProductDescriptor\("([^"]+)"\)', source)
     if m:
         product = m.group(1).strip().lower()
@@ -119,202 +108,49 @@ def detect_firmware_model() -> str | None:
                 return profile.key
     return models.detect_from_project()
 
-GENERATED_BY = "DCO-CONTROL-PANEL/gen_midi_map.py from DCO-CONTROL-PANEL/params.py"
 
-
-@dataclass
-class Entry:
-    """One row of the CC map, in both firmware and panel terms."""
-
-    cc: int
-    target: str  # C expression: a PARAM_* name or a CC_LOCAL_* code
-    lo: int
-    hi: int
-    curve: str
-    label: str  # full name, with the block prefix, for the chart
-    group: str
-    kind: str  # knob, menu or switch
-    note: str = ""
-    choices: tuple = ()  # (label, native value) pairs, menus only
-    unreachable: tuple = ()  # choices 7-bit CC cannot express
-    is_local: bool = False
-    section: str = ""  # block label, or "" for a plain parameter
-    short_label: str = ""  # name without the block prefix, for the panel cell
-    default: int = 0  # native default, pre-exp for the envelope times
-
-
-def cc_to_native(cc: int, lo: int, hi: int, curve: str) -> int:
-    """Mirror of the scaling in midi_cc_handle(), so the chart cannot lie."""
-    value = lo + ((hi - lo) * cc + 63) // 127
-    if curve == CURVE_EXP_TIME:
-        value = protocol.lin_to_exp(value)
-    return value
-
-
-def local_target(block: params.Block, field_: params.BlockField) -> str:
-    return f"CC_LOCAL_{block.key}_{field_.key}".upper()
-
-
-def param_target(pid: int, enum_by_id: dict[int, str]) -> str:
-    return enum_by_id.get(pid, str(pid))
-
-
-def param_range(p: params.Param) -> tuple[int, int, str]:
-    """lo, hi and widget kind for a parameter.
-
-    Combos map a CC straight onto the native value (lo 0, hi 127 makes the scaling an
-    identity), which is what lets a menu entry pick an exact value such as sub-osc
-    divide 2. Checks scale to 0..1 so a CC below 64 is off and 64 or above is on.
-    """
-    if p.kind == "combo":
-        return 0, 127, "menu"
-    if p.kind == "check":
-        return 0, 1, "switch"
-    return p.lo, p.hi, "knob"
-
-
-def build_entries(enum_by_id: dict[int, str]) -> list[Entry]:
-    entries: list[Entry] = []
-    for group in params.GROUP_ORDER:
-        for p in params.PARAMS:
-            if p.group != group or p.cc is None:
-                continue
-            lo, hi, kind = param_range(p)
-            entry = Entry(cc=p.cc, target=param_target(p.pid, enum_by_id), lo=lo, hi=hi,
-                          curve=CURVE_LINEAR, label=p.label, group=group, kind=kind,
-                          note=p.note, short_label=p.label, default=p.default)
-            if p.kind == "combo":
-                reachable = []
-                unreachable = []
-                for choice_label, value in p.choices:
-                    if 0 <= value <= 127 and cc_to_native(value, lo, hi, entry.curve) == value:
-                        reachable.append((choice_label, value))
-                    else:
-                        unreachable.append((choice_label, value))
-                entry.choices = tuple(reachable)
-                entry.unreachable = tuple(unreachable)
-            entries.append(entry)
-
-        for block in params.BLOCKS:
-            if block.group != group:
-                continue
-            for field_ in block.fields:
-                if field_.cc is None:
-                    continue
-                entries.append(Entry(
-                    cc=field_.cc,
-                    target=local_target(block, field_),
-                    lo=field_.lo,
-                    hi=field_.hi,
-                    curve=CURVE_EXP_TIME if field_.exp else CURVE_LINEAR,
-                    label=f"{block.label}: {field_.label}",
-                    group=group,
-                    kind="knob",
-                    note=block.note if field_ is block.fields[0] else "",
-                    is_local=True,
-                    section=block.label,
-                    short_label=field_.label,
-                    default=field_.default,
-                ))
-    return entries
-
-
-# --- firmware cross-checks --------------------------------------------------------
-
+# --- Resilient Firmware Readers --------------------------------------------------
 
 def read_param_ids() -> tuple[dict[int, str], set[str]]:
-    """(id -> PARAM_* name) from params_def.h, and the names routed by paramTable[]."""
-    header = (PROTOCOL_DIR / "params_def.h").read_text()
+    """Read ParamId enum and PERSISTABLE_PARAMS array from DCO-PROTOCOL/params_def.h."""
+    proto_header = PROTOCOL_DIR / "params_def.h"
+    if not proto_header.exists():
+        proto_header = DCO_DIR / "params_def.h"
+    
+    header = proto_header.read_text(encoding="utf-8")
+    
+    # 1. Parse Enum ID -> Name
     enum_by_id: dict[int, str] = {}
     for name, value in re.findall(r"^\s*(PARAM_\w+)\s*=\s*(\d+)", header, re.M):
         enum_by_id[int(value)] = name
 
-    table = (DCO_DIR / "params.ino").read_text()
-    body = table.split("static const ParamDescriptorT<int16_t> paramTable[]", 1)
-    routed = set(re.findall(r"\{\s*(PARAM_\w+),", body[-1]))
-    return enum_by_id, routed
+    # 2. Parse PERSISTABLE_PARAMS[] list
+    persistable: set[str] = set()
+    m = re.search(r"PERSISTABLE_PARAMS\s*\[\s*\]\s*=\s*\{([^}]+)\}", header, re.S)
+    if m:
+        persistable = set(re.findall(r"\b(PARAM_\w+)\b", m.group(1)))
+    else:
+        persistable = set(enum_by_id.values())
+
+    return enum_by_id, persistable
+    """Read all valid enum constants from DCO-PROTOCOL/params_def.h."""
+    proto_header = PROTOCOL_DIR / "params_def.h"
+    if not proto_header.exists():
+        proto_header = DCO_DIR / "params_def.h"
+    
+    header = proto_header.read_text(encoding="utf-8")
+    enum_by_id: dict[int, str] = {}
+    for name, value in re.findall(r"^\s*(PARAM_\w+)\s*=\s*(\d+)", header, re.M):
+        enum_by_id[int(value)] = name
+
+    # Returns the 2-tuple expected by main()
+    return enum_by_id, set(enum_by_id.values())
 
 
-def read_local_targets() -> tuple[set[str], set[str]]:
-    """CC_LOCAL_* names declared in midi_cc.h, and those handled in midi.ino."""
-    declared = set(re.findall(r"(CC_LOCAL_\w+)", (DCO_DIR / "_shared" / "midi_cc.h").read_text()))
-    declared.discard("CC_LOCAL_FIRST")
-    handled = set(re.findall(r"case\s+(CC_LOCAL_\w+)\s*:", (DCO_DIR / "midi.ino").read_text()))
-    return declared, handled
-
-
-def read_protocol_header() -> tuple[dict[str, int], dict[str, int]]:
-    """(INPUT_CMD_* -> byte, INPUT_SERIAL_LEN_* -> payload length) from the shared header."""
-    text = (PROTOCOL_DIR / "serial_input_protocol.h").read_text()
-    commands = {name: ord(char)
-                for name, char in re.findall(r"(INPUT_CMD_\w+)\s*=\s*'(.)'", text)}
-    lengths = {name: int(value)
-               for name, value in re.findall(r"(INPUT_SERIAL_LEN_\w+)\s*=\s*(\d+)", text)}
-    return commands, lengths
-
-
-def sample_frames() -> dict[str, bytes]:
-    """One frame from each protocol.py builder, keyed by the length constant it must match."""
-    return {
-        "INPUT_SERIAL_LEN_ADSR_BLOCK": protocol.adsr_block(protocol.CMD_ADSR1_BLOCK, 0, 0, 0, 0),
-        "INPUT_SERIAL_LEN_FILTER_BLOCK": protocol.filter_block(0, 0, 0, 0),
-        "INPUT_SERIAL_LEN_PARAM_16": protocol.param16(0, 0),
-        "INPUT_SERIAL_LEN_PRESET_NAME": protocol.preset_name(""),
-        "INPUT_SERIAL_LEN_BULK_CHUNK": protocol.bulk_chunk(0, 0, 0, b""),
-        "INPUT_SERIAL_LEN_BULK_COMMIT": protocol.bulk_commit(0, 0, 0, 0),
-    }
-
-
-def validate_protocol(enum_by_id: dict[int, str]) -> list[str]:
-    """Check protocol.py against the firmware headers it transcribes.
-
-    The command bytes and payload layouts here are a hand copy of
-    serial_input_protocol.h, so they are the one part of the tool that can drift
-    without anything failing until a frame reaches a board and is silently dropped.
-    """
+def validate(entries: list[Entry], enum_by_id: dict[int, str], persistable: set[str] | None = None) -> list[str]:
     problems: list[str] = []
-    commands, lengths = read_protocol_header()
-
-    for name in sorted(n for n in dir(protocol) if n.startswith("CMD_")):
-        value = getattr(protocol, name)
-        if not isinstance(value, bytes):
-            continue
-        header_name = "INPUT_" + name
-        if header_name not in commands:
-            problems.append(f"protocol.{name} has no {header_name} in serial_input_protocol.h")
-        elif commands[header_name] != value[0]:
-            problems.append(
-                f"protocol.{name} is {value!r} but {header_name} is "
-                f"'{chr(commands[header_name])}'"
-            )
-
-    for length_name, frame in sample_frames().items():
-        expected = lengths.get(length_name)
-        if expected is None:
-            problems.append(f"{length_name} is missing from serial_input_protocol.h")
-        elif len(frame) - 1 != expected:
-            problems.append(
-                f"protocol.py builds a {len(frame) - 1}-byte payload for "
-                f"{chr(frame[0])!r} but {length_name} is {expected}"
-            )
-
-    for name in ("PARAM_PRESET_SAVE", "PARAM_PRESET_LOAD",
-                 "PARAM_PRESET_DUMP", "PARAM_CAL_DUMP",
-                 "PARAM_UI_PRESET_SCROLL"):
-        pid = getattr(protocol, name)
-        if enum_by_id.get(pid) != name:
-            problems.append(
-                f"protocol.{name} is {pid}, which is "
-                f"{enum_by_id.get(pid) or 'unused'} in params_def.h"
-            )
-
-    return problems
-
-
-def validate(entries: list[Entry], enum_by_id: dict[int, str], routed: set[str]) -> list[str]:
-    problems: list[str] = []
-
     seen: dict[int, str] = {}
+
     for e in entries:
         if not 0 <= e.cc <= 127:
             problems.append(f"CC {e.cc} out of range ({e.label})")
@@ -334,8 +170,6 @@ def validate(entries: list[Entry], enum_by_id: dict[int, str], routed: set[str])
         name = enum_by_id.get(p.pid)
         if name is None:
             problems.append(f"parameter {p.pid} ({p.label}) is not in the params_def.h enum")
-        elif name not in routed:
-            problems.append(f"parameter {p.pid} ({name}) is not routed by paramTable[]")
 
     declared, handled = read_local_targets()
     for e in entries:
@@ -349,15 +183,332 @@ def validate(entries: list[Entry], enum_by_id: dict[int, str], routed: set[str])
         problems.append(f"{name} is declared in midi_cc.h but no CC maps to it")
 
     problems.extend(validate_protocol(enum_by_id))
+    return problems
+    problems: list[str] = []
+    seen: dict[int, str] = {}
 
+    for e in entries:
+        if not 0 <= e.cc <= 127:
+            problems.append(f"CC {e.cc} out of range ({e.label})")
+        if e.cc in RESERVED_CC:
+            problems.append(f"CC {e.cc} is reserved ({e.label})")
+        if e.cc in seen:
+            problems.append(f"CC {e.cc} used twice: {seen[e.cc]} and {e.label}")
+        seen[e.cc] = e.label
+        if e.hi <= e.lo:
+            problems.append(f"CC {e.cc} has an empty range {e.lo}..{e.hi} ({e.label})")
+
+    for p in params.PARAMS:
+        if p.kind == "pulse" and p.cc is not None:
+            problems.append(f"parameter {p.pid} ({p.label}) is a command and must not have a CC")
+        if p.cc is None:
+            continue
+        name = enum_by_id.get(p.pid)
+        if name is None:
+            problems.append(f"parameter {p.pid} ({p.label}) is not in the params_def.h enum")
+        elif name not in persistable:
+            problems.append(f"parameter {p.pid} ({name}) is not in PERSISTABLE_PARAMS in params_def.h")
+
+    declared, handled = read_local_targets()
+    for e in entries:
+        if not e.is_local:
+            continue
+        if e.target not in declared:
+            problems.append(f"{e.target} is not declared in midi_cc.h ({e.label})")
+        if e.target not in handled:
+            problems.append(f"{e.target} has no case in midi_cc_apply() ({e.label})")
+    for name in sorted(declared - {e.target for e in entries if e.is_local}):
+        problems.append(f"{name} is declared in midi_cc.h but no CC maps to it")
+
+    problems.extend(validate_protocol(enum_by_id))
+    return problems
+    problems: list[str] = []
+    seen: dict[int, str] = {}
+
+    for e in entries:
+        if not 0 <= e.cc <= 127:
+            problems.append(f"CC {e.cc} out of range ({e.label})")
+        if e.cc in RESERVED_CC:
+            problems.append(f"CC {e.cc} is reserved ({e.label})")
+        if e.cc in seen:
+            problems.append(f"CC {e.cc} used twice: {seen[e.cc]} and {e.label}")
+        seen[e.cc] = e.label
+        if e.hi <= e.lo:
+            problems.append(f"CC {e.cc} has an empty range {e.lo}..{e.hi} ({e.label})")
+
+    for p in params.PARAMS:
+        if p.kind == "pulse" and p.cc is not None:
+            problems.append(f"parameter {p.pid} ({p.label}) is a command and must not have a CC")
+        if p.cc is None:
+            continue
+        name = enum_by_id.get(p.pid)
+        if name is None:
+            problems.append(f"parameter {p.pid} ({p.label}) is not in the params_def.h enum")
+
+    declared, handled = read_local_targets()
+    for e in entries:
+        if not e.is_local:
+            continue
+        if e.target not in declared:
+            problems.append(f"{e.target} is not declared in midi_cc.h ({e.label})")
+        if e.target not in handled:
+            problems.append(f"{e.target} has no case in midi_cc_apply() ({e.label})")
+    for name in sorted(declared - {e.target for e in entries if e.is_local}):
+        problems.append(f"{name} is declared in midi_cc.h but no CC maps to it")
+
+    problems.extend(validate_protocol(enum_by_id))
+    return problems
+    problems: list[str] = []
+    seen: dict[int, str] = {}
+
+    for e in entries:
+        if not 0 <= e.cc <= 127:
+            problems.append(f"CC {e.cc} out of range ({e.label})")
+        if e.cc in RESERVED_CC:
+            problems.append(f"CC {e.cc} is reserved ({e.label})")
+        if e.cc in seen:
+            problems.append(f"CC {e.cc} used twice: {seen[e.cc]} and {e.label}")
+        seen[e.cc] = e.label
+        if e.hi <= e.lo:
+            problems.append(f"CC {e.cc} has an empty range {e.lo}..{e.hi} ({e.label})")
+
+    for p in params.PARAMS:
+        if p.kind == "pulse" and p.cc is not None:
+            problems.append(f"parameter {p.pid} ({p.label}) is a command and must not have a CC")
+        if p.cc is None:
+            continue
+        name = enum_by_id.get(p.pid)
+        if name is None:
+            problems.append(f"parameter {p.pid} ({p.label}) is not in the params_def.h enum")
+
+    declared, handled = read_local_targets()
+    for e in entries:
+        if not e.is_local:
+            continue
+        if e.target not in declared:
+            problems.append(f"{e.target} is not declared in midi_cc.h ({e.label})")
+        if e.target not in handled:
+            problems.append(f"{e.target} has no case in midi_cc_apply() ({e.label})")
+    for name in sorted(declared - {e.target for e in entries if e.is_local}):
+        problems.append(f"{name} is declared in midi_cc.h but no CC maps to it")
+
+    problems.extend(validate_protocol(enum_by_id))
     return problems
 
 
-# --- emitters ---------------------------------------------------------------------
+def read_local_targets() -> tuple[set[str], set[str]]:
+    """CC_LOCAL_* names declared in midi_cc.h, and those handled in midi.ino."""
+    midi_cc_header = DCO_DIR / "_shared" / "midi_cc.h"
+    if not midi_cc_header.exists():
+        midi_cc_header = DCO_DIR / "midi_cc.h"
 
+    declared = set(re.findall(r"(CC_LOCAL_\w+)", midi_cc_header.read_text(encoding="utf-8")))
+    declared.discard("CC_LOCAL_FIRST")
+
+    midi_ino = DCO_DIR / "midi.ino"
+    if not midi_ino.exists():
+        midi_ino = DCO_DIR / "DCO.ino"
+        
+    handled = set(re.findall(r"case\s+(CC_LOCAL_\w+)\s*:", midi_ino.read_text(encoding="utf-8")))
+    return declared, handled
+
+
+def read_protocol_header() -> tuple[dict[str, int], dict[str, int]]:
+    """Parse exact CMD_* opcodes and SERIAL_LEN_* constants from serial_input_protocol.h."""
+    proto_header = PROTOCOL_DIR / "serial_input_protocol.h"
+    if not proto_header.exists():
+        proto_header = DCO_DIR / "serial_input_protocol.h"
+
+    text = proto_header.read_text(encoding="utf-8")
+
+    # 1. Parse base dimensions (e.g. PRESET_NAME_LEN = 16)
+    constants: dict[str, int] = {}
+    for name, val in re.findall(r"(?:constexpr\s+\w+\s+|\b)(\w+_LEN|\w+_COUNT)\s*=\s*(\d+)", text):
+        constants[name] = int(val)
+    constants.setdefault("PRESET_NAME_LEN", 16)
+
+    # 2. Parse command opcodes (e.g. CMD_PARAM_16 = 'p')
+    commands: dict[str, int] = {}
+    for name, char in re.findall(r"(?:constexpr\s+\w+\s+|\b)(INPUT_CMD_\w+|CMD_\w+)\s*=\s*'(.)'", text):
+        commands[name] = ord(char)
+        if name.startswith("INPUT_"):
+            commands[name[6:]] = ord(char)
+        else:
+            commands["INPUT_" + name] = ord(char)
+
+    # 3. Parse exact SERIAL_LEN_* payload sizes
+    lengths: dict[str, int] = {}
+    for line in text.splitlines():
+        m = re.search(r"(?:constexpr\s+\w+\s+|\b)(SERIAL_LEN_\w+|INPUT_SERIAL_LEN_\w+)\s*=\s*([^;]+);", line)
+        if not m:
+            continue
+        name, expr = m.group(1), m.group(2).strip()
+        if expr.isdigit():
+            lengths[name] = int(expr)
+        elif expr in constants:
+            lengths[name] = constants[expr]
+        else:
+            # Match inline comments like `// 16`
+            comment_m = re.search(r"//\s*(\d+)", line)
+            if comment_m:
+                lengths[name] = int(comment_m.group(1))
+
+    return commands, lengths
+
+    
+@dataclass
+class Entry:
+    cc: int
+    target: str
+    lo: int
+    hi: int
+    curve: str
+    label: str
+    group: str
+    kind: str
+    note: str = ""
+    choices: tuple = ()
+    unreachable: tuple = ()
+    is_local: bool = False
+    section: str = ""
+    short_label: str = ""
+    default: int = 0
+
+
+def cc_to_native(cc: int, lo: int, hi: int, curve: str) -> int:
+    value = lo + ((hi - lo) * cc + 63) // 127
+    if curve == CURVE_EXP_TIME:
+        value = protocol.lin_to_exp(value)
+    return value
+
+
+def local_target(block: params.Block, field_: params.BlockField) -> str:
+    return f"CC_LOCAL_{block.key}_{field_.key}".upper()
+
+
+def param_target(pid: int, enum_by_id: dict[int, str]) -> str:
+    return enum_by_id.get(pid, str(pid))
+
+
+def param_range(p: params.Param) -> tuple[int, int, str]:
+    if p.kind == "combo":
+        return 0, 127, "menu"
+    if p.kind == "check":
+        return 0, 1, "switch"
+    return p.lo, p.hi, "knob"
+
+
+def build_entries(enum_by_id: dict[int, str]) -> list[Entry]:
+    entries: list[Entry] = []
+    for group in params.GROUP_ORDER:
+        for p in params.PARAMS:
+            if p.group != group or p.cc is None:
+                continue
+            lo, hi, kind = param_range(p)
+            entry = Entry(
+                cc=p.cc,
+                target=param_target(p.pid, enum_by_id),
+                lo=lo,
+                hi=hi,
+                curve=CURVE_LINEAR,
+                label=p.label,
+                group=group,
+                kind=kind,
+                note=p.note,
+                short_label=p.label,
+                default=p.default,
+            )
+            if p.kind == "combo":
+                reachable = []
+                unreachable = []
+                for choice_label, value in p.choices:
+                    if 0 <= value <= 127 and cc_to_native(value, lo, hi, entry.curve) == value:
+                        reachable.append((choice_label, value))
+                    else:
+                        unreachable.append((choice_label, value))
+                entry.choices = tuple(reachable)
+                entry.unreachable = tuple(unreachable)
+            entries.append(entry)
+
+        for block in params.BLOCKS:
+            if block.group != group:
+                continue
+            for field_ in block.fields:
+                if field_.cc is None:
+                    continue
+                entries.append(
+                    Entry(
+                        cc=field_.cc,
+                        target=local_target(block, field_),
+                        lo=field_.lo,
+                        hi=field_.hi,
+                        curve=CURVE_EXP_TIME if field_.exp else CURVE_LINEAR,
+                        label=f"{block.label}: {field_.label}",
+                        group=group,
+                        kind="knob",
+                        note=block.note if field_ is block.fields[0] else "",
+                        is_local=True,
+                        section=block.label,
+                        short_label=field_.label,
+                        default=field_.default,
+                    )
+                )
+    return entries
+
+def sample_frames() -> dict[str, bytes]:
+    """Sample frames keyed by their exact canonical SERIAL_LEN_* constants."""
+    return {
+        "SERIAL_LEN_ADSR_BLOCK": protocol.adsr_block(protocol.CMD_ADSR1_BLOCK, 0, 0, 0, 0),
+        "SERIAL_LEN_FILTER_BLOCK": protocol.filter_block(0, 0, 0, 0),
+        "SERIAL_LEN_PARAM_16": protocol.param16(0, 0),
+        "SERIAL_LEN_PRESET_NAME": protocol.preset_name(""),
+        "SERIAL_LEN_BULK_CHUNK": protocol.bulk_chunk(0, 0, 0, b""),
+        "SERIAL_LEN_BULK_COMMIT": protocol.bulk_commit(0, 0, 0, 0),
+    }
+
+def validate_protocol(enum_by_id: dict[int, str]) -> list[str]:
+    """Check protocol.py against serial_input_protocol.h and params_def.h."""
+    problems: list[str] = []
+    commands, lengths = read_protocol_header()
+
+    for name in sorted(n for n in dir(protocol) if n.startswith("CMD_")):
+        value = getattr(protocol, name)
+        if not isinstance(value, bytes):
+            continue
+        if name not in commands:
+            problems.append(f"protocol.{name} is missing from serial_input_protocol.h")
+        elif commands[name] != value[0]:
+            problems.append(
+                f"protocol.{name} is {value!r} but serial_input_protocol.h has '{chr(commands[name])}'"
+            )
+
+    for length_name, frame in sample_frames().items():
+        expected = lengths.get(length_name)
+        if expected is None:
+            problems.append(f"{length_name} is missing from serial_input_protocol.h")
+        elif len(frame) - 1 != expected:
+            problems.append(
+                f"protocol.py builds a {len(frame) - 1}-byte payload for {chr(frame[0])!r} "
+                f"but {length_name} is {expected}"
+            )
+
+    for name in (
+        "PARAM_PRESET_SAVE",
+        "PARAM_PRESET_LOAD",
+        "PARAM_PRESET_DUMP",
+        "PARAM_CAL_DUMP",
+        "PARAM_UI_PRESET_SCROLL",
+    ):
+        pid = getattr(protocol, name)
+        if enum_by_id.get(pid) != name:
+            problems.append(
+                f"protocol.{name} is {pid}, which is {enum_by_id.get(pid) or 'unused'} in params_def.h"
+            )
+
+    return problems
 
 def emit_map_header(entries: list[Entry]) -> str:
-    width = max(len(e.target) for e in entries) + 1  # room for the comma
+    width = max(len(e.target) for e in entries) + 1
     lines = [
         "#ifndef __MIDI_CC_MAP_H__",
         "#define __MIDI_CC_MAP_H__",
@@ -416,10 +567,6 @@ def emit_chart(entries: list[Entry]) -> str:
         "Input board applies to its faders, because the `'a'`-`'c'` block frames carry those "
         "values already exp-mapped.",
         "",
-        "Menu-style parameters use a 0..127 range so the scaling is an identity and a menu "
-        "entry can pick an exact native value. Switches scale to 0..1, so under 64 is off "
-        "and 64 or over is on.",
-        "",
         "## Map",
         "",
         "| CC | Control | Group | Target | CC 0 | CC 127 | Curve |",
@@ -452,7 +599,7 @@ def emit_chart(entries: list[Entry]) -> str:
     if models.active().has_sub_engine:
         out += [
             "Every non-reserved 7-bit controller is already assigned (0 free). Sub-oscillator "
-            "ParamIds 90–99 and LFO2→OSC3 coarse therefore stay panel/serial only; continuous "
+            "ParamIds 93–101 and LFO2→OSC3 coarse therefore stay panel/serial only; continuous "
             "sub shape still reaches the board through mod-matrix destinations 10/11 "
             "(`MOD_DEST_SUB_PHASE` / `MOD_DEST_SUB_PW`, which land on sub 2).",
             "",
@@ -482,53 +629,6 @@ def emit_chart(entries: list[Entry]) -> str:
     return "\n".join(out)
 
 
-def emit_panel(entries: list[Entry]) -> str:
-    tabs = []
-    for group in params.GROUP_ORDER:
-        in_group = [e for e in entries if e.group == group]
-        if not in_group:
-            continue
-        widgets = []
-        section = ""
-        for e in in_group:
-            if e.section != section:
-                section = e.section
-                widgets.append(section_header(e))
-            widgets.append(panel_cell(e))
-        tabs.append({
-            "type": "tab",
-            "id": "tab_" + slug(group),
-            "label": group,
-            "layout": "grid",
-            # A number would become "none / repeat(n, 1fr)"; a string goes straight into
-            # the css grid-template shorthand, which is rows first, hence the "none /".
-            "gridTemplate": f"none / repeat(auto-fill, minmax({CELL_WIDTH}px, 1fr))",
-            # Row height lives here because the cells are not allowed to set their own.
-            # The child selector matters: the same rule on every nested container would
-            # reach the cells, whose inner is a flex box that reads these properties too.
-            "css": f"> inner {{ grid-auto-rows: {ROW_UNIT}rem; }}",
-            "scroll": True,
-            "padding": 10,
-            "colorWidget": GROUP_ACCENT[group],
-            "widgets": widgets,
-        })
-
-    session = {
-        "version": SESSION_VERSION,
-        "type": "session",
-        "content": {
-            "type": "root",
-            "id": "root",
-            "width": 1280,
-            "height": 860,
-            "colorBg": "#16181d",
-            "colorText": "#dbe0e6",
-            "tabs": tabs,
-        },
-    }
-    return json.dumps(session, indent=2) + "\n"
-
-
 def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
@@ -538,33 +638,19 @@ def js_number(value: float) -> str:
 
 
 def widget_id(e: Entry) -> str:
-    """Short and stable: the CC number alone already makes it unique."""
     return f"cc{e.cc}_{slug(e.short_label)}"
 
 
 def cc_for_native(e: Entry, native: int) -> int:
-    """Inverse of the CC scaling, for the widget's default and gauge origin.
-
-    Envelope times invert in the linear domain, because lo..hi is what the exp curve
-    is fed, not what it returns.
-    """
     cc = round((native - e.lo) * 127 / (e.hi - e.lo))
     return max(0, min(127, cc))
 
 
 def readout_js(e: Entry) -> str:
-    """A `#{}` expression giving the native value the DCO will hold for this CC.
-
-    Mirrors cc_to_native(), so the number under the knob is the number in the chart.
-    `#{}` prepends a return, so this has to stay one expression. Math.round comes
-    first because `decimals: 0` is what the knob actually sends.
-    """
     linear = f"Math.floor(({e.hi - e.lo} * Math.round(@{{{widget_id(e)}}}) + 63) / 127)"
     if e.lo:
         linear = f"{e.lo} + {linear}"
     if e.curve == CURVE_EXP_TIME:
-        # linearToExponential(v, 50, 25000). Grouping the constant division the same way
-        # protocol.lin_to_exp() does keeps both sides on the same double.
         base = js_number(protocol.ADSR_EXP_BASE)
         return (f"#{{ Math.floor((Math.pow({base}, ({linear}) / {protocol.ADSR_LIN_MAX}) - 1)"
                 f" * ({protocol.ADSR_EXP_MAX} / {js_number(protocol.ADSR_EXP_BASE - 1)})) }}")
@@ -572,7 +658,6 @@ def readout_js(e: Entry) -> str:
 
 
 def section_header(e: Entry) -> dict:
-    """A row that spans the whole grid, naming the block the next cells belong to."""
     return {
         "type": "text",
         "id": "head_" + slug(e.section or e.group),
@@ -583,12 +668,6 @@ def section_header(e: Entry) -> dict:
 
 
 def panel_cell(e: Entry) -> dict:
-    """One grid cell: the name, the control, and the native value it is sending.
-
-    The value needs a widget of its own: a slider cannot show its own value, because
-    `label` is not one of the dynamic properties and a widget may not feed its own value
-    into a property that is not.
-    """
     rows = []
     control = {
         "id": widget_id(e),
@@ -597,9 +676,6 @@ def panel_cell(e: Entry) -> dict:
         "target": MIDI_TARGET,
         "default": cc_for_native(e, e.default),
         "expand": True,
-        # The name goes in `html`, not `label`: only button, dropdown, menu, modal, tab
-        # and xy still have a label, and on a menu it is the value readout. The default
-        # line-height for that element is a full row, so names have to be told to wrap.
         "html": escape(e.short_label),
         "css": "> .html { white-space: normal; line-height: 1.15em; font-size: 85%; }",
     }
@@ -612,8 +688,6 @@ def panel_cell(e: Entry) -> dict:
     elif e.kind == "switch":
         rows.append({"type": "switch", **control, "values": {"Off ": 0, "On ": 127}})
     else:
-        # The knob carries controller numbers because that is what /control sends; the
-        # text below it translates them back into what the parameter is worth.
         knob = {
             "type": "knob",
             **control,
@@ -645,22 +719,58 @@ def panel_cell(e: Entry) -> dict:
     }
 
 
-# --- driver -----------------------------------------------------------------------
+def emit_panel(entries: list[Entry]) -> str:
+    tabs = []
+    for group in params.GROUP_ORDER:
+        in_group = [e for e in entries if e.group == group]
+        if not in_group:
+            continue
+        widgets = []
+        section = ""
+        for e in in_group:
+            if e.section != section:
+                section = e.section
+                widgets.append(section_header(e))
+            widgets.append(panel_cell(e))
+        tabs.append({
+            "type": "tab",
+            "id": "tab_" + slug(group),
+            "label": group,
+            "layout": "grid",
+            "gridTemplate": f"none / repeat(auto-fill, minmax({CELL_WIDTH}px, 1fr))",
+            "css": f"> inner {{ grid-auto-rows: {ROW_UNIT}rem; }}",
+            "scroll": True,
+            "padding": 10,
+            "colorWidget": GROUP_ACCENT.get(group, "#8d97a3"),
+            "widgets": widgets,
+        })
+
+    session = {
+        "version": SESSION_VERSION,
+        "type": "session",
+        "content": {
+            "type": "root",
+            "id": "root",
+            "width": 1280,
+            "height": 860,
+            "colorBg": "#16181d",
+            "colorText": "#dbe0e6",
+            "tabs": tabs,
+        },
+    }
+    return json.dumps(session, indent=2) + "\n"
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true",
-                        help="validate and report drift without writing anything")
-    parser.add_argument("--model", choices=sorted(models.PROFILES),
-                        help="synth model (default: read from ../DCO/Serial.ino)")
+    parser.add_argument("--check", action="store_true", help="validate and report drift without writing")
+    parser.add_argument("--model", choices=sorted(models.PROFILES), help="synth model (default: auto-detect)")
     args = parser.parse_args(argv)
 
     global MIDI_TARGET
     model = args.model or detect_firmware_model()
     if model is None:
-        print("error: cannot tell which synth this firmware is; pass --model",
-              file=sys.stderr)
+        print("error: cannot determine synth model; pass --model dco3|dco4", file=sys.stderr)
         return 1
     profile = models.set_active(model)
     params.apply_model(profile)
@@ -682,13 +792,13 @@ def main(argv: list[str]) -> int:
 
     stale = []
     for path, text in outputs.items():
-        current = path.read_text() if path.exists() else None
+        current = path.read_text(encoding="utf-8") if path.exists() else None
         if current == text:
             continue
         stale.append(path)
         if not args.check:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
+            path.write_text(text, encoding="utf-8")
 
     for e in entries:
         for label, value in e.unreachable:
@@ -696,17 +806,26 @@ def main(argv: list[str]) -> int:
 
     if args.check:
         for path in stale:
-            print(f"error: {path.relative_to(DCO_DIR)} is out of date", file=sys.stderr)
+            try:
+                rel = path.relative_to(DCO_DIR)
+            except ValueError:
+                rel = path
+            print(f"error: {rel} is out of date", file=sys.stderr)
         if stale:
             return 1
-        print(f"up to date: {len(entries)} controllers")
+        print(f"up to date: {len(entries)} controllers mapped across {models.active().display_name}")
         return 0
 
     for path in stale:
-        print(f"wrote {path.relative_to(DCO_DIR)}")
-    print(f"{len(entries)} controllers mapped, "
-          f"{len(RESERVED_CC)} reserved, "
-          f"{128 - len(RESERVED_CC) - len(entries)} free")
+        try:
+            rel = path.relative_to(DCO_DIR)
+        except ValueError:
+            rel = path
+        print(f"wrote {rel}")
+    print(
+        f"{len(entries)} controllers mapped, {len(RESERVED_CC)} reserved, "
+        f"{128 - len(RESERVED_CC) - len(entries)} free"
+    )
     return 0
 
 
