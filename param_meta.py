@@ -1,17 +1,81 @@
-"""Bridge and parser for DCO-PROTOCOL/param_meta.h.
-
+"""Bridge and parser for DCO-PROTOCOL/param_meta.h and params_def.h.
 Provides dynamic lookup for display names, curve choices, waveform choices,
 voice modes, and bipolar/octave display value scaling.
 """
-
 from __future__ import annotations
 
-import re
 from pathlib import Path
+import re
 
 HERE = Path(__file__).resolve().parent
 PROTOCOL_DIR = HERE.parent / "DCO-PROTOCOL"
-PARAM_META_HEADER = PROTOCOL_DIR / "param_meta.h"
+PARAMS_DEF_HEADER = PROTOCOL_DIR / "params_def.h"
+
+
+def _read_params_def_text() -> str:
+    if PARAMS_DEF_HEADER.exists():
+        return PARAMS_DEF_HEADER.read_text(encoding="utf-8")
+    dco_header = HERE.parent / "DCO" / "params_def.h"
+    if dco_header.exists():
+        return dco_header.read_text(encoding="utf-8")
+    return ""
+
+
+def load_mod_sources() -> tuple[tuple[str, int], ...]:
+    """Parse enum ModSource from params_def.h and strip 'SRC_' prefix."""
+    text = _read_params_def_text()
+    m = re.search(r"enum\s+ModSource\s*:\s*\w+\s*\{([^}]+)\}", text, re.S)
+    if not m:
+        # Fallback if header is unavailable
+        return (
+            ("0 - OFF", 0), ("1 - LFO1", 1), ("2 - LFO2", 2),
+            ("3 - ENV_VCA", 3), ("4 - ENV_VCF", 4), ("5 - ENV_DCO", 5),
+            ("6 - MODWHEEL", 6), ("7 - AFTERTC", 7), ("8 - VELOCITY", 8),
+            ("9 - BEND", 9), ("10 - DRIFT", 10), ("11 - KEYTRACK", 11),
+            ("12 - DRIFT_VOICE", 12), ("13 - RANDOM_SH", 13), ("14 - VOICE_ID", 14),
+        )
+
+    results: list[tuple[str, int]] = []
+    for line in m.group(1).splitlines():
+        item_match = re.search(r"^\s*([A-Z0-9_]+)\s*=\s*(\d+)", line)
+        if item_match:
+            raw_name = item_match.group(1)
+            val = int(item_match.group(2))
+            clean_name = raw_name[4:] if raw_name.startswith("SRC_") else raw_name
+            label = f"{val} - {clean_name}"
+            results.append((label, val))
+
+    return tuple(results)
+
+
+def load_mod_destinations() -> tuple[tuple[str, int], ...]:
+    """Parse enum ModDest from params_def.h and strip 'DEST_' prefix."""
+    text = _read_params_def_text()
+    m = re.search(r"enum\s+ModDest\s*:\s*\w+\s*\{([^}]+)\}", text, re.S)
+    if not m:
+        # Fallback if header is unavailable
+        return (
+            ("0 - PITCH", 0), ("1 - VCF_CUTOFF", 1), ("2 - OSC1_LEVEL", 2),
+            ("3 - OSC2_LEVEL", 3), ("4 - SUB_LEVEL", 4), ("5 - DIST_DRIVE", 5),
+            ("6 - DIST_MIX", 6), ("7 - VCA_LEVEL", 7), ("8 - VCF_RESO", 8),
+            ("9 - ENV_TO_VCF", 9), ("10 - ENV_TO_VCA", 10), ("11 - LFO1_SPEED", 11),
+            ("12 - LFO2_SPEED", 12), ("13 - LFO1_DEPTH", 13), ("14 - LFO2_DEPTH", 14),
+            ("15 - OSC2_DETUNE", 15), ("16 - PW", 16), ("17 - ENV_VCF_ATTACK", 17),
+            ("18 - ENV_VCF_DECAY", 18), ("19 - ENV_VCA_ATTACK", 19),
+            ("20 - ENV_VCA_DECAY", 20), ("21 - ENV_ALL_TIME", 21),
+        )
+
+    results: list[tuple[str, int]] = []
+    for line in m.group(1).splitlines():
+        item_match = re.search(r"^\s*([A-Z0-9_]+)\s*=\s*(\d+)", line)
+        if item_match:
+            raw_name = item_match.group(1)
+            val = int(item_match.group(2))
+            clean_name = raw_name[5:] if raw_name.startswith("DEST_") else raw_name
+            label = f"{val} - {clean_name}"
+            results.append((label, val))
+
+    return tuple(results)
 
 # Fallback definitions matching param_meta.h directly
 CURVE_PROFILES: tuple[tuple[str, int], ...] = (

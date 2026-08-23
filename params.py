@@ -60,41 +60,9 @@ GROUP_ORDER = [
     GROUP_CAL,
 ]
 
-_MOD_SOURCES = (
-    ("Off / empty", 255),
-    ("0 ADSR3 (EnvDCO)", 0),
-    ("1 ADSR4 (stub)", 1),
-    ("2 LFO3 (stub)", 2),
-    ("3 LFO4 (stub)", 3),
-    ("4 Velocity", 4),
-    ("5 Keytrack", 5),
-    ("6 Random", 6),
-    ("7 Aftertouch", 7),
-    ("8 LFO1", 8),
-    ("9 LFO2", 9),
-    ("10 Pitch bend", 10),
-    ("11 Mod wheel", 11),
-    ("12 Noise 0", 12),
-    ("13 Noise 1", 13),
-    ("14 Noise 2 (reserved)", 14),
-    ("15 Noise 3 (reserved)", 15),
-)
-
-_MOD_DESTS = (
-    ("Off / empty", 255),
-    ("0 OSC1 level", 0),
-    ("1 OSC2 level", 1),
-    ("2 OSC3 level", 2),
-    ("3 Sub level", 3),
-    ("4 VCF1 reso", 4),
-    ("5 VCF2 reso", 5),
-    ("6 Dist Drive", 6),
-    ("7 VCF cutoff", 7),
-    ("8 Dist Mix", 8),
-    ("9 Pitch (±1 oct @ ±1023)", 9),
-    ("10 Sub phase (sub 2)", 10),
-    ("11 Sub pulse width (sub 2)", 11),
-)
+# --- Modulation Matrix Sources & Destinations (Parsed automatically from params_def.h) ---
+_MOD_SOURCES = param_meta.load_mod_sources()
+_MOD_DESTS = param_meta.load_mod_destinations()
 
 # --- Sub-oscillators (ENABLE_SUBOSC_ENGINE2, RP2350 only; IDs 93–101) --------
 _SUB_DIVIDES = (
@@ -317,30 +285,30 @@ PARAMS: list[Param] = [
     Param(219, "LFO2 to OSC2 coarse", GROUP_LFO, "slider", 0, 511, 0, cc=119),
     Param(220, "LFO2 to OSC3 coarse", GROUP_LFO, "slider", 0, 511, 0),
 
-    # --- Modulation Matrix (Slots 0..7 => ParamIds 63..86) -------------------
-    Param(63, "Mod slot 0 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=84),
-    Param(64, "Mod slot 0 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=85),
+# --- Modulation Matrix (Slots 0..7 => ParamIds 63..86) -------------------
+    Param(63, "Mod slot 0 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=84),
+    Param(64, "Mod slot 0 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=85),
     Param(65, "Mod slot 0 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=86),
-    Param(66, "Mod slot 1 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=87),
-    Param(67, "Mod slot 1 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=88),
+    Param(66, "Mod slot 1 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=87),
+    Param(67, "Mod slot 1 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=88),
     Param(68, "Mod slot 1 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=89),
-    Param(69, "Mod slot 2 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=90),
-    Param(70, "Mod slot 2 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=91),
+    Param(69, "Mod slot 2 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=90),
+    Param(70, "Mod slot 2 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=91),
     Param(71, "Mod slot 2 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=92),
-    Param(72, "Mod slot 3 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=93),
-    Param(73, "Mod slot 3 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=94),
+    Param(72, "Mod slot 3 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=93),
+    Param(73, "Mod slot 3 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=94),
     Param(74, "Mod slot 3 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=95),
-    Param(75, "Mod slot 4 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=96),
-    Param(76, "Mod slot 4 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=97),
+    Param(75, "Mod slot 4 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=96),
+    Param(76, "Mod slot 4 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=97),
     Param(77, "Mod slot 4 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=102),
-    Param(78, "Mod slot 5 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=103),
-    Param(79, "Mod slot 5 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=104),
+    Param(78, "Mod slot 5 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=103),
+    Param(79, "Mod slot 5 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=104),
     Param(80, "Mod slot 5 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=105),
-    Param(81, "Mod slot 6 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=106),
-    Param(82, "Mod slot 6 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=107),
+    Param(81, "Mod slot 6 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=106),
+    Param(82, "Mod slot 6 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=107),
     Param(83, "Mod slot 6 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=108),
-    Param(84, "Mod slot 7 source", GROUP_MOD, "combo", default=255, choices=_MOD_SOURCES, cc=109),
-    Param(85, "Mod slot 7 dest", GROUP_MOD, "combo", default=255, choices=_MOD_DESTS, cc=110),
+    Param(84, "Mod slot 7 source", GROUP_MOD, "combo", default=0, choices=_MOD_SOURCES, cc=109),
+    Param(85, "Mod slot 7 dest", GROUP_MOD, "combo", default=0, choices=_MOD_DESTS, cc=110),
     Param(86, "Mod slot 7 depth", GROUP_MOD, "slider", -4095, 4095, 0, cc=111),
 
     # --- Character ---
