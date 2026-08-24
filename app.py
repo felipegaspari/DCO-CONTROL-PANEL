@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -73,11 +74,11 @@ OSC_WAVE_MATRIX = [
 OSC_WAVE_COLS = ("Saw", "Pulse", "Tri")
 
 ENV_ADSR_BLOCKS = ("adsr_vca", "adsr_vcf", "adsr_dco")
-ENV_CURVE_RESTART_PIDS = (8, 9, 214, 48, 49, 51, 52, 54, 55)
+ENV_CURVE_RESTART_PIDS = (8, 9, 214, 48, 49, 50, 51, 52, 53, 54, 55, 56)
 ENV_CURVE_COLUMNS = (
-    ("EnvVCA curves", 48, 49, 8),
-    ("EnvVCF curves", 51, 52, 9),
-    ("EnvDCO curves", 54, 55, 214),
+    ("EnvVCA curves", 48, 49, 50, 8),
+    ("EnvVCF curves", 51, 52, 53, 9),
+    ("EnvDCO curves", 54, 55, 56, 214),
 )
 
 PID_RUN_AUTOTUNE = 150
@@ -273,6 +274,10 @@ class App(QMainWindow):
             font.setPointSize(effective_font_size)
             app.setFont(font)
 
+        if hasattr(self, "preset_name_entry"):
+            self.preset_name_entry.setFixedWidth(int(170 * self.zoom_scale))
+
+
         if hasattr(self, "status_dot") and hasattr(self, "link"):
             dot_col = (
                 theme.PALETTES[self.mode]["ok"]
@@ -449,24 +454,27 @@ class App(QMainWindow):
         prev_btn.clicked.connect(self._preset_prev)
         lay.addWidget(prev_btn)
 
-        self.preset_spin = QSpinBox()
-        self.preset_spin.setRange(0, presets.NUM_SLOTS - 1)
-        self.preset_spin.setDisplayIntegerBase(10)
-        self.preset_spin.valueChanged.connect(self._preset_number_committed)
-        lay.addWidget(self.preset_spin)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(260)
+        self.preset_combo.setMaxVisibleItems(25)
+        self.preset_combo.currentIndexChanged.connect(self._preset_number_committed)
+        lay.addWidget(self.preset_combo, 1)
+
+        next_btn = QPushButton(">")
+        next_btn.setFixedWidth(32)
+        next_btn.clicked.connect(self._preset_next)
+        lay.addWidget(next_btn)
 
         self.preset_dirty_label = QLabel("")
         self.preset_dirty_label.setFixedWidth(12)
         lay.addWidget(self.preset_dirty_label)
 
         self.preset_name_entry = QLineEdit("Init")
+        self.preset_name_entry.setMaxLength(16)
+        self.preset_name_entry.setFixedWidth(170)
         self.preset_name_entry.textChanged.connect(self._refresh_dirty)
-        lay.addWidget(self.preset_name_entry, 1)
 
-        next_btn = QPushButton(">")
-        next_btn.setFixedWidth(32)
-        next_btn.clicked.connect(self._preset_next)
-        lay.addWidget(next_btn)
+        lay.addWidget(self.preset_name_entry)
 
         for text, slot_fn in (
             ("Load", self._preset_load),
@@ -675,11 +683,11 @@ class App(QMainWindow):
         # Curves
         curves_box = QGroupBox("Curves & Routing")
         curves_lay = QHBoxLayout(curves_box)
-        for col_name, a_pid, d_pid, r_pid in ENV_CURVE_COLUMNS:
+        for col_name, a_pid, d_pid, rel_pid, r_pid in ENV_CURVE_COLUMNS:
             col_box = QGroupBox(col_name)
             clay = QVBoxLayout(col_box)
-            if a_pid is not None and d_pid is not None:
-                for pid, title in ((a_pid, "Attack"), (d_pid, "Decay")):
+            for pid, title in ((a_pid, "Attack"), (d_pid, "Decay"), (rel_pid, "Release")):
+                if pid is not None and pid in PARAM_BY_PID:
                     clay.addWidget(QLabel(title))
                     p = PARAM_BY_PID[pid]
                     cb = QComboBox()
@@ -1427,7 +1435,19 @@ class App(QMainWindow):
 
     def _init_presets(self) -> None:
         self.bank = presets.load_bank()
+        self._refresh_preset_combo()
         self._preset_recall(int(self.bank["current"]), send=False, persist_current=False)
+    def _refresh_preset_combo(self) -> None:
+        """Re-populates the dropdown without triggering a load."""
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for i in range(presets.NUM_SLOTS):
+            slot = self.bank["slots"][i]
+            name = "Init" if presets.slot_is_empty(slot) else slot["name"]
+            self.preset_combo.addItem(f"{i:03d}: {name}")
+        
+        self.preset_combo.setCurrentIndex(int(self.bank.get("current", 0)))
+        self.preset_combo.blockSignals(False)
 
     def _current_ui_slot(self, name: str | None = None) -> dict:
         def get_val(p: params.Param) -> int:
@@ -1472,9 +1492,9 @@ class App(QMainWindow):
             self._clean_fp = presets.slot_fingerprint(
                 presets.defaults_slot() if empty else slot
             )
-            self.preset_spin.blockSignals(True)
-            self.preset_spin.setValue(index)
-            self.preset_spin.blockSignals(False)
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(index)
+            self.preset_combo.blockSignals(False)
             self.bank["current"] = index
         finally:
             self._preset_loading = False
@@ -1519,55 +1539,52 @@ class App(QMainWindow):
             w.setChecked(bool(val))
 
     def _preset_number_committed(self) -> None:
-        idx = self.preset_spin.value()
+        idx = self.preset_combo.currentIndex()
         if idx == int(self.bank.get("current", -1)):
             return
         self._preset_recall(idx, send=True, persist_current=True)
 
     def _preset_prev(self) -> None:
-        idx = (self.preset_spin.value() - 1) % presets.NUM_SLOTS
+        idx = (self.preset_combo.currentIndex() - 1) % presets.NUM_SLOTS
         self._preset_recall(idx, send=True, persist_current=True)
 
     def _preset_next(self) -> None:
-        idx = (self.preset_spin.value() + 1) % presets.NUM_SLOTS
+        idx = (self.preset_combo.currentIndex() + 1) % presets.NUM_SLOTS
         self._preset_recall(idx, send=True, persist_current=True)
 
     def _preset_load(self) -> None:
-        self._preset_recall(self.preset_spin.value(), send=True, persist_current=True)
+        self._preset_recall(self.preset_combo.currentIndex(), send=True, persist_current=True)
 
     def _preset_save(self, index: int | None = None) -> None:
         if index is None:
-            index = self.preset_spin.value()
+            index = self.preset_combo.currentIndex()
         name = self.preset_name_entry.text().strip() or "Untitled"
         slot = self._current_ui_slot(name)
         self.bank["slots"][index] = slot
         self.bank["current"] = index
         presets.save_bank(self.bank)
         self._clean_fp = presets.slot_fingerprint(slot)
+        self._refresh_preset_combo()
         self._refresh_dirty()
         self.log(f"[preset] saved {index:03d} {name}\n")
         if self._browser and self._browser.isVisible():
             self._browser.refresh()
 
     def _preset_save_as(self) -> None:
-        idx, ok = QInputDialog.getInt(
-            self,
-            "Save as…",
-            "Slot (0–255):",
-            self.preset_spin.value(),
-            0,
-            presets.NUM_SLOTS - 1,
-        )
-        if not ok:
-            return
-        name, ok = QInputDialog.getText(
-            self, "Save as…", "Preset name:", text=self.preset_name_entry.text()
-        )
-        if not ok:
-            return
-        self.preset_name_entry.setText(name.strip() or "Untitled")
-        self.preset_spin.setValue(idx)
-        self._preset_save(idx)
+        dlg = SaveAsDialog(self, self.preset_combo.currentIndex(), self.preset_name_entry.text())
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            idx, name = dlg.get_data()
+            
+            # Apply name to UI
+            self.preset_name_entry.setText(name)
+            
+            # Point combo to new index (silently)
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(idx)
+            self.preset_combo.blockSignals(False)
+            
+            # Perform the save logic
+            self._preset_save(idx)
 
     def _preset_init(self) -> None:
         self._preset_loading = True
@@ -1805,7 +1822,7 @@ class App(QMainWindow):
             self.send_now(protocol.preset_name(self.preset_name_entry.text()))
             self.send_now(
                 protocol.param16(
-                    protocol.PARAM_UI_PRESET_SCROLL, self.preset_spin.value()
+                    protocol.PARAM_UI_PRESET_SCROLL, self.preset_combo.currentIndex()
                 )
             )
             n += 2            
@@ -1834,50 +1851,110 @@ class App(QMainWindow):
         self.link.close()
         event.accept()
 
+class SaveAsDialog(QDialog):
+    def __init__(self, app: App, current_idx: int, current_name: str) -> None:
+        super().__init__(app)
+        self.setWindowTitle("Save As...")
+        self.resize(350, 400)
+        
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Select destination slot:"))
+        
+        # Scrollable list of slots
+        self.list_widget = QListWidget()
+        for i in range(presets.NUM_SLOTS):
+            slot = app.bank["slots"][i]
+            name = "Init" if presets.slot_is_empty(slot) else slot["name"]
+            self.list_widget.addItem(f"{i:03d}: {name}")
+        
+        self.list_widget.setCurrentRow(current_idx)
+        layout.addWidget(self.list_widget)
+        
+        layout.addWidget(QLabel("Preset Name:"))
+        self.name_input = QLineEdit(current_name)
+        layout.addWidget(self.name_input)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("AccentButton")
+        save_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(save_btn)
+        
+        layout.addLayout(btn_layout)
+
+    def get_data(self) -> tuple[int, str]:
+        idx = self.list_widget.currentRow()
+        name = self.name_input.text().strip() or "Untitled"
+        return idx, name
 
 class PresetBrowser(QDialog):
     def __init__(self, app: App) -> None:
         super().__init__(app)
         self.app = app
         self.setWindowTitle("Preset Browser")
-        self.resize(720, 600)
+        self.resize(780, 660)
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # 1. Search & Filter Header
+        filter_box = QHBoxLayout()
+        filter_box.addWidget(QLabel("Search:"))
+        self.filter_entry = QLineEdit()
+        self.filter_entry.setPlaceholderText("Filter by slot number or preset name...")
+        self.filter_entry.textChanged.connect(self._apply_filter)
+        filter_box.addWidget(self.filter_entry, 1)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.filter_entry.clear)
+        filter_box.addWidget(clear_btn)
+        lay.addLayout(filter_box)
+
+        # 2. Presets Table
         self.table = QTableWidget(presets.NUM_SLOTS, 3)
-        self.table.setHorizontalHeaderLabels(["Slot", "Local Name", "Board Name"])
-        self.table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
-        )
+        self.table.setHorizontalHeaderLabels(["Slot", "Local Patch Name", "Board (LittleFS) Name"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.cellDoubleClicked.connect(lambda: self._local_load())
         lay.addWidget(self.table)
 
-        # Local Actions
+        # 3. Local Bank Actions
         local_box = QGroupBox("Local Bank")
         l_lay = QHBoxLayout(local_box)
         for name, fn in (
-            ("Load", self._local_load),
-            ("Save Into", self._local_save_into),
-            ("Rename", self._local_rename),
-            ("Delete", self._local_delete),
+            ("Load into Synth", self._local_load),
+            ("Save Current UI into Slot", self._local_save_into),
+            ("Rename…", self._local_rename),
+            ("Delete Slot", self._local_delete),
         ):
             btn = QPushButton(name)
             btn.clicked.connect(fn)
             l_lay.addWidget(btn)
         lay.addWidget(local_box)
 
-        # MCU Actions
-        mcu_box = QGroupBox("Board (MCU)")
+        # 4. Board (MCU) Actions
+        mcu_box = QGroupBox("Board (MCU LittleFS)")
         m_lay = QHBoxLayout(mcu_box)
         for name, fn in (
             ("Refresh Board List", self._mcu_refresh_dir),
             ("Send Slot → Board", self._mcu_send_slot),
             ("Fetch Slot ← Board", self._mcu_fetch_slot),
-            ("Push All", self._mcu_push_all),
-            ("Pull All", self._mcu_pull_all),
+            ("Recall on Board", self._mcu_recall_on_board),
+            ("Push All → Board", self._mcu_push_all),
+            ("Pull All ← Board", self._mcu_pull_all),
         ):
             btn = QPushButton(name)
             btn.clicked.connect(fn)
@@ -1891,37 +1968,126 @@ class PresetBrowser(QDialog):
         return rows[0].row() if rows else 0
 
     def refresh(self) -> None:
+        active_idx = int(self.app.bank.get("current", -1))
+        palette = theme.PALETTES[self.app.mode]
+        accent_col = QColor(palette["accent"])
+        muted_col = QColor(palette["muted"])
+
         for i in range(presets.NUM_SLOTS):
             slot = self.app.bank["slots"][i]
-            name = "" if presets.slot_is_empty(slot) else slot["name"]
+            is_active = (i == active_idx)
+            
+            # Column 0: Slot indicator
+            slot_str = f"▶ {i:03d}" if is_active else f"  {i:03d}"
+            item_slot = QTableWidgetItem(slot_str)
+            if is_active:
+                font = item_slot.font()
+                font.setBold(True)
+                item_slot.setFont(font)
+                item_slot.setForeground(accent_col)
+            self.table.setItem(i, 0, item_slot)
+
+            # Column 1: Local Name
+            if presets.slot_is_empty(slot):
+                item_name = QTableWidgetItem("[Empty]")
+                item_name.setForeground(muted_col)
+            else:
+                item_name = QTableWidgetItem(slot["name"])
+                if is_active:
+                    font = item_name.font()
+                    font.setBold(True)
+                    item_name.setFont(font)
+                    item_name.setForeground(accent_col)
+            self.table.setItem(i, 1, item_name)
+
+            # Column 2: Board Name
             mcu_name = self.app.mcu_dir.get(i, "")
-            self.table.setItem(i, 0, QTableWidgetItem(f"{i:03d}"))
-            self.table.setItem(i, 1, QTableWidgetItem(name))
-            self.table.setItem(i, 2, QTableWidgetItem(mcu_name))
+            item_mcu = QTableWidgetItem(mcu_name)
+            self.table.setItem(i, 2, item_mcu)
+
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        query = self.filter_entry.text().strip().lower()
+        for i in range(presets.NUM_SLOTS):
+            if not query:
+                self.table.setRowHidden(i, False)
+                continue
+
+            slot = self.app.bank["slots"][i]
+            local_name = ("" if presets.slot_is_empty(slot) else slot["name"]).lower()
+            mcu_name = self.app.mcu_dir.get(i, "").lower()
+            slot_num_str = f"{i:03d}"
+
+            match = (query in slot_num_str or str(i) == query or query in local_name or query in mcu_name)
+            self.table.setRowHidden(i, not match)
 
     def _local_load(self) -> None:
-        self.app._preset_recall(self._selected_row(), send=True, persist_current=True)
+        idx = self._selected_row()
+        self.app._preset_recall(idx, send=True, persist_current=True)
+        self.refresh()
 
     def _local_save_into(self) -> None:
-        self.app._preset_save(self._selected_row())
+        idx = self._selected_row()
+        slot = self.app.bank["slots"][idx]
+        if not presets.slot_is_empty(slot):
+            res = QMessageBox.question(
+                self,
+                "Overwrite Preset",
+                f"Slot {idx:03d} already contains '{slot['name']}'. Overwrite it with the current UI patch?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if res != QMessageBox.StandardButton.Yes:
+                return
+
+        self.app._preset_save(idx)
         self.refresh()
 
     def _local_rename(self) -> None:
         idx = self._selected_row()
         slot = self.app.bank["slots"][idx]
         if presets.slot_is_empty(slot):
+            QMessageBox.information(self, "Rename Preset", f"Slot {idx:03d} is currently empty.")
             return
-        name, ok = QInputDialog.getText(self, "Rename", "Name:", text=slot["name"])
+
+        name, ok = QInputDialog.getText(self, "Rename Preset", f"New name for slot {idx:03d}:", text=slot["name"])
         if ok:
-            slot["name"] = name.strip() or "Untitled"
+            clean_name = name.strip() or "Untitled"
+            slot["name"] = clean_name
             presets.save_bank(self.app.bank)
+            if idx == int(self.app.bank.get("current", -1)):
+                self.app.preset_name_entry.setText(clean_name)
+            self.app._refresh_preset_combo()
             self.refresh()
 
     def _local_delete(self) -> None:
         idx = self._selected_row()
+        slot = self.app.bank["slots"][idx]
+        if presets.slot_is_empty(slot):
+            return
+
+        res = QMessageBox.warning(
+            self,
+            "Delete Preset",
+            f"Are you sure you want to clear slot {idx:03d} ('{slot['name']}')?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if res != QMessageBox.StandardButton.Yes:
+            return
+
         self.app.bank["slots"][idx] = None
         presets.save_bank(self.app.bank)
+        self.app._refresh_preset_combo()
         self.refresh()
+
+    def _mcu_recall_on_board(self) -> None:
+        idx = self._selected_row()
+        if not self.app._mcu_ready():
+            return
+        self.app.mcu.recall_slot(
+            idx,
+            lambda ok, _: self.app.log(f"[mcu] recalled slot {idx:03d} on board\n" if ok else f"[mcu] recall failed\n")
+        )
 
     def _mcu_refresh_dir(self) -> None:
         if not self.app._mcu_ready():
@@ -1936,7 +2102,11 @@ class PresetBrowser(QDialog):
     def _mcu_send_slot(self) -> None:
         idx = self._selected_row()
         slot = self.app.bank["slots"][idx]
-        if not presets.slot_is_empty(slot) and self.app._mcu_ready():
+        if presets.slot_is_empty(slot):
+            QMessageBox.information(self, "Send Slot", f"Local slot {idx:03d} is empty.")
+            return
+
+        if self.app._mcu_ready():
             rec = fileformats.slot_to_record(slot)
             self.app.mcu.push_preset_record(
                 idx, rec, lambda ok, _: self._mcu_refresh_dir()
@@ -1954,7 +2124,9 @@ class PresetBrowser(QDialog):
             slot = fileformats.record_to_slot(payload)
             self.app.bank["slots"][idx] = slot
             presets.save_bank(self.app.bank)
+            self.app._refresh_preset_combo()
             self.refresh()
+            self.app.log(f"[mcu] fetched slot {idx:03d} '{slot['name']}'\n")
 
     def _mcu_push_all(self) -> None:
         entries = [
@@ -1965,9 +2137,19 @@ class PresetBrowser(QDialog):
         if not entries or not self.app._mcu_ready():
             return
 
+        res = QMessageBox.warning(
+            self,
+            "Push All Presets to MCU",
+            f"This will write {len(entries)} local presets into the board's LittleFS flash storage. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if res != QMessageBox.StandardButton.Yes:
+            return
+
         def step(k: int):
             if k >= len(entries):
                 self._mcu_refresh_dir()
+                self.app.log("[mcu] push all completed\n")
                 return
             i, slot = entries[k]
             self.app.mcu.push_preset_record(
@@ -1980,6 +2162,15 @@ class PresetBrowser(QDialog):
         if not self.app._mcu_ready():
             return
 
+        res = QMessageBox.warning(
+            self,
+            "Pull All Presets from MCU",
+            "This will overwrite occupied local slots with the presets currently stored on the board. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if res != QMessageBox.StandardButton.Yes:
+            return
+
         def on_dir(ok, payload):
             if not ok or not payload:
                 return
@@ -1988,7 +2179,9 @@ class PresetBrowser(QDialog):
             def step(k: int):
                 if k >= len(slots):
                     presets.save_bank(self.app.bank)
+                    self.app._refresh_preset_combo()
                     self.refresh()
+                    self.app.log("[mcu] pull all completed\n")
                     return
                 i = slots[k]
                 self.app.mcu.dump_preset_slot(
@@ -2007,7 +2200,6 @@ class PresetBrowser(QDialog):
             except ValueError:
                 pass
         next_fn()
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="DCO Bench Controller (PySide6)")
