@@ -1815,17 +1815,22 @@ class App(QMainWindow):
             return 0
         self.pending.clear()
         n = 0
+        slot_idx = self.preset_combo.currentIndex()
+
         screen = models.active().has_screen_signals
         if screen:
+            # 1. Silence screen toast notifications during parameter burst
             self.send_now(protocol.screen_signal(protocol.SCREEN_SIGNAL_SILENT))
             n += 1
-            self.send_now(protocol.preset_name(self.preset_name_entry.text()))
-            self.send_now(
-                protocol.param16(
-                    protocol.PARAM_UI_PRESET_SCROLL, self.preset_combo.currentIndex()
-                )
-            )
-            n += 2            
+
+        # 2. Tell DCO the target slot number FIRST
+        self.send_now(protocol.param16(protocol.PARAM_UI_PRESET_SCROLL, slot_idx))
+        n += 1
+
+        # 3. Send the preset name (DCO forwards with the updated slot_idx)
+        self.send_now(protocol.preset_name(self.preset_name_entry.text()))
+        n += 1
+        
         for p in presets.patch_params():
             w = self.param_widgets.get(p.pid)
             val = p.default
