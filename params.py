@@ -243,7 +243,12 @@ PARAMS: list[Param] = [
           choices=(("0 - OSC1", 0), ("1 - OSC2", 1), ("2 - OSC1+2", 2), ("3 - OSC3", 3), ("4 - all", 4)),
           cc=25),
     Param(47, "ADSR3 to OSC1 detune", GROUP_ENV, "slider", -511, 511, 0, cc=26),
-    Param(223, "EnvDCO pitch centered", GROUP_ENV, "check", default=0),
+    
+    # Envelope Modes (0=NORMAL, 1=CENTERED, 2=INVERTED)
+    Param(224, "EnvVCA mode", GROUP_ENV, "combo", default=0, choices=param_meta.ENV_MODES),
+    Param(225, "EnvVCF mode", GROUP_ENV, "combo", default=0, choices=param_meta.ENV_MODES),
+    Param(223, "EnvDCO mode", GROUP_ENV, "combo", default=0, choices=param_meta.ENV_MODES),
+
     Param(48, "ADSR1 attack curve", GROUP_ENV, "combo", default=0, choices=param_meta.CURVE_PROFILES, cc=27),
     Param(49, "ADSR1 decay curve", GROUP_ENV, "combo", default=0, choices=param_meta.CURVE_PROFILES, cc=28),
     Param(50, "ADSR1 release curve", GROUP_ENV, "combo", default=0, choices=param_meta.CURVE_PROFILES),
@@ -453,7 +458,7 @@ CHARACTER_JITTER_DEFAULT = 0
 
 DEBUG_PARAM_ID = 160
 
-_SUB_ONLY_MOD_DEST_VALUES = {10, 11}
+_SUB_ONLY_MOD_DEST_VALUES = {}
 _MOD_DEST_PIDS = {64, 67, 70, 73, 76, 79, 82, 85}
 
 

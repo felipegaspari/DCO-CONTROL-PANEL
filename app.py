@@ -74,11 +74,11 @@ OSC_WAVE_MATRIX = [
 OSC_WAVE_COLS = ("Saw", "Pulse", "Tri")
 
 ENV_ADSR_BLOCKS = ("adsr_vca", "adsr_vcf", "adsr_dco")
-ENV_CURVE_RESTART_PIDS = (8, 9, 214, 48, 49, 50, 51, 52, 53, 54, 55, 56)
+ENV_CURVE_RESTART_PIDS = (8, 9, 214, 48, 49, 50, 51, 52, 53, 54, 55, 56, 223, 224, 225)
 ENV_CURVE_COLUMNS = (
-    ("EnvVCA curves", 48, 49, 50, 8),
-    ("EnvVCF curves", 51, 52, 53, 9),
-    ("EnvDCO curves", 54, 55, 56, 214),
+    ("EnvVCA (ADSR1)", 224, 48, 49, 50, 8),
+    ("EnvVCF (ADSR2)", 225, 51, 52, 53, 9),
+    ("EnvDCO (ADSR3)", 223, 54, 55, 56, 214),
 )
 
 PID_RUN_AUTOTUNE = 150
@@ -680,13 +680,33 @@ class App(QMainWindow):
             times_lay.addWidget(bbox)
         parent_layout.addWidget(times_box)
 
-        # Curves
-        curves_box = QGroupBox("Curves & Routing")
+        # Curves & Modes Columns
+        curves_box = QGroupBox("Modes & Curves")
         curves_lay = QHBoxLayout(curves_box)
-        for col_name, a_pid, d_pid, rel_pid, r_pid in ENV_CURVE_COLUMNS:
+        for col_name, mode_pid, a_pid, d_pid, rel_pid, r_pid in ENV_CURVE_COLUMNS:
             col_box = QGroupBox(col_name)
             clay = QVBoxLayout(col_box)
-            for pid, title in ((a_pid, "Attack"), (d_pid, "Decay"), (rel_pid, "Release")):
+
+            # Mode Dropdown
+            if mode_pid is not None and mode_pid in PARAM_BY_PID:
+                clay.addWidget(QLabel("Mode"))
+                mp = PARAM_BY_PID[mode_pid]
+                mcb = QComboBox()
+                for label, val in mp.choices:
+                    mcb.addItem(label, val)
+                mcb.setCurrentIndex(
+                    next((i for i, c in enumerate(mp.choices) if c[1] == mp.default), 0)
+                )
+                mcb.currentIndexChanged.connect(
+                    lambda idx, pid=mp.pid, cb=mcb: self._on_combo_changed(
+                        pid, cb.itemData(idx)
+                    )
+                )
+                clay.addWidget(mcb)
+                self.param_widgets[mp.pid] = mcb
+
+            # Attack / Decay / Release Curves
+            for pid, title in ((a_pid, "Attack Curve"), (d_pid, "Decay Curve"), (rel_pid, "Release Curve")):
                 if pid is not None and pid in PARAM_BY_PID:
                     clay.addWidget(QLabel(title))
                     p = PARAM_BY_PID[pid]
@@ -694,7 +714,7 @@ class App(QMainWindow):
                     for label, val in p.choices:
                         cb.addItem(label, val)
                     cb.setCurrentIndex(
-                        next(i for i, c in enumerate(p.choices) if c[1] == p.default)
+                        next((i for i, c in enumerate(p.choices) if c[1] == p.default), 0)
                     )
                     cb.currentIndexChanged.connect(
                         lambda idx, pid=p.pid, cb=cb: self._on_combo_changed(
@@ -703,7 +723,9 @@ class App(QMainWindow):
                     )
                     clay.addWidget(cb)
                     self.param_widgets[p.pid] = cb
-            if r_pid is not None:
+
+            # Restart Checkbox
+            if r_pid is not None and r_pid in PARAM_BY_PID:
                 rp = PARAM_BY_PID[r_pid]
                 chk = QCheckBox(rp.label)
                 chk.setChecked(bool(rp.default))
@@ -712,10 +734,12 @@ class App(QMainWindow):
                 )
                 clay.addWidget(chk)
                 self.param_widgets[rp.pid] = chk
+
             clay.addStretch(1)
             curves_lay.addWidget(col_box)
         parent_layout.addWidget(curves_box)
 
+        # Remaining Envelope Parameters
         for p in params.PARAMS:
             if p.group == params.GROUP_ENV and p.pid not in ENV_CURVE_RESTART_PIDS:
                 self._add_param_widget(parent_layout, p)
@@ -1846,6 +1870,12 @@ class App(QMainWindow):
             self.queue_block(block.key)
             n += 1
         self._flush()
+
+        # 4. Unsilence screen and refresh preset display
+        if screen:
+            self.send_now(protocol.screen_signal(protocol.SCREEN_SIGNAL_PRESET_SCROLL))
+            n += 1
+
         self.log(f"[send] patch {n} frames\n")
         return n
 
@@ -1885,11 +1915,13 @@ class SaveAsDialog(QDialog):
         btn_layout.addStretch()
         
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setAutoDefault(False)
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
         
         save_btn = QPushButton("Save")
         save_btn.setObjectName("AccentButton")
+        save_btn.setDefault(True)
         save_btn.clicked.connect(self.accept)
         btn_layout.addWidget(save_btn)
         
@@ -1899,7 +1931,7 @@ class SaveAsDialog(QDialog):
         idx = self.list_widget.currentRow()
         name = self.name_input.text().strip() or "Untitled"
         return idx, name
-
+        
 class PresetBrowser(QDialog):
     def __init__(self, app: App) -> None:
         super().__init__(app)
