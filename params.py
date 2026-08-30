@@ -225,6 +225,8 @@ PARAMS: list[Param] = [
     Param(91, "OSC3 Pulse enable", GROUP_OSC, "check", default=0, cc=116),
     Param(92, "OSC3 Tri enable", GROUP_OSC, "check", default=0, cc=117),
 
+    Param(130, "Crossmod depth", GROUP_OSC, "slider", 0, 32767, 0),
+
     # --- Sub-oscillators (ENABLE_SUBOSC_ENGINE2; RP2350 only) ----------------
     Param(93, "Sub 1 divide", GROUP_SUB, "combo", default=0, choices=_SUB_DIVIDES, models=("dco3",)),
     Param(95, "Sub 1 master", GROUP_SUB, "combo", default=0, choices=_SUB_MASTERS, models=("dco3",)),

@@ -91,53 +91,36 @@ def load_mod_destinations() -> tuple[tuple[str, int], ...]:
         return (("0 - Master Pitch", 0), ("1 - Cutoff", 1))
     return tuple(results)
 
-CURVE_PROFILES: tuple[tuple[str, int], ...] = (
-    ("0 - EXP", 0),
-    ("1 - SOFT", 1),
-    ("2 - STEEP", 2),
-    ("3 - CONCAVE", 3),
-    ("4 - FAST S", 4),
-    ("5 - SLOW THEN LIN", 5),
-    ("6 - ALMOST LIN", 6),
-    ("7 - LINEAR", 7),
-)
+# --- Dynamic C++ Switch Case Parser for Numeric Enums ---
+def load_enum_choices(func_name: str, fallback: tuple[tuple[str, int], ...] = ()) -> tuple[tuple[str, int], ...]:
+    """Parse case N: return " Label"; from any switch function in param_meta.h."""
+    meta_text = _read_header_text("param_meta.h")
+    pattern = rf"{func_name}\s*\([^)]*\)\s*\{{(.*?)\n\}}"
+    match = re.search(pattern, meta_text, re.DOTALL)
+    if not match:
+        return fallback
 
-VOICE_MODES: tuple[tuple[str, int], ...] = (
-    ("0 - MONO", 0),
-    ("1 - POLY", 1),
-    ("2 - UNISON", 2),
-)
+    body = match.group(1)
+    choices: list[tuple[str, int]] = []
 
-VOICE_ALLOC_MODES: tuple[tuple[str, int], ...] = (
-    ("0 - ROUND ROBIN", 0),
-    ("1 - OLDEST", 1),
-    ("2 - QUIETEST", 2),
-    ("3 - QUIETEST LOW", 3),
-    ("4 - QUIETEST HIGH", 4),
-    ("5 - NO STEAL", 5),
-)
+    # Matches: case 0: return " OFF";
+    for case_match in re.finditer(r'case\s+(-?\d+)\s*:\s*return\s*"([^"]*)";', body):
+        val = int(case_match.group(1))
+        label = case_match.group(2).strip()
+        if "out of range" not in label.lower():
+            choices.append((f"{val} - {label}", val))
 
-LFO_WAVEFORMS: tuple[tuple[str, int], ...] = (
-    ("0 - Off", 0),
-    ("1 - Saw", 1),
-    ("2 - Analog Sine", 2),
-    ("3 - Sine", 3),
-    ("4 - Square", 4),
-    ("5 - Sharktooth", 5),
-    ("6 - Trapezoid", 6),
-    ("7 - Linear Tri", 7),
-    ("8 - Staircase", 8),
-    ("9 - Folded Sine", 9),
-    ("10 - Analog Tape", 10),
-    ("11 - Analog Tube", 11),
-    ("12 - Analog Broken", 12),
-)
+    return tuple(choices) if choices else fallback
 
-ENV_MODES: tuple[tuple[str, int], ...] = (
-    ("0 - NORMAL", 0),
-    ("1 - CENTERED", 1),
-    ("2 - INVERTED", 2),
-)
+# --- Dynamically Populated Tuples (Single Source of Truth: param_meta.h) ---
+CURVE_PROFILES     = load_enum_choices("param_curve_name")
+VOICE_MODES        = load_enum_choices("param_voice_mode_name")
+VOICE_ALLOC_MODES  = load_enum_choices("param_voice_alloc_name")
+LFO_WAVEFORMS      = load_enum_choices("param_lfo_waveform_name")
+ENV_MODES          = load_enum_choices("param_env_mode_name")
+SYNC_MODES         = load_enum_choices("param_sync_mode_name")
+SOFT_SYNC_MODES    = load_enum_choices("param_soft_sync_mode_name")
+PORTA_MODES        = load_enum_choices("param_portamento_mode_name")
 
 def scale_display_value(pid: int, val: int) -> int:
     if pid == 13:  # PARAM_OSC1_INTERVAL

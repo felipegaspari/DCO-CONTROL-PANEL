@@ -63,7 +63,7 @@ PARAM_BY_PID = {p.pid: p for p in params.PARAMS}
 # Layout constants
 # Layout constants in app.py
 OSC_PITCH_PIDS = (13, 14, 34, 15, 35)
-OSC_SYNC_PIDS = (32, 37, 38, 17)
+OSC_SYNC_PIDS = (32, 37, 38, 17, 130,)
 OSC_VOICE_PIDS = (26, 27, 28, 18, 33, 29, 30, 31, 43, 21)
 OSC_LEVEL_PIDS = (22, 23, 39, 24)
 OSC_WAVE_MATRIX = [
