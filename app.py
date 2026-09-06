@@ -1426,26 +1426,27 @@ class App(QMainWindow):
 
         core_lay.addLayout(top_opts)
 
-        # Cutoff & Resonance Sliders (Block Fields)
+        # Core Sliders: Cutoff, Resonance, and EnvVCF Depth
         self.block_widgets["filter"] = {}
         block = self.blocks_by_key["filter"]
         for f in block.fields:
-            if f.key in ("cutoff", "resonance"):
-                lbl_text = "Cutoff Freq" if f.key == "cutoff" else "Resonance"
-                self._create_filter_block_slider(core_lay, f, lbl_text)
+            if f.key == "cutoff":
+                self._create_filter_block_slider(core_lay, f, "Cutoff Freq")
+            elif f.key == "resonance":
+                self._create_filter_block_slider(core_lay, f, "Resonance")
+            elif f.key == "adsr2_to_vcf":
+                self._create_filter_block_slider(core_lay, f, "EnvVCF (ADSR 2) Depth")
 
         vcf_col.addWidget(core_box)
 
-        # 2. Cutoff Modulation Routings
+        # 2. Cutoff Modulation Routings (LFO, Keytrack, Velocity)
         mod_box = QGroupBox("Cutoff Modulation")
         mod_lay = QVBoxLayout(mod_box)
         mod_lay.setSpacing(6)
 
-        # Block fields: EnvVCF and LFO2 to Cutoff
+        # LFO 2 Mod Depth
         for f in block.fields:
-            if f.key == "adsr2_to_vcf":
-                self._create_filter_block_slider(mod_lay, f, "EnvVCF (ADSR 2) Depth")
-            elif f.key == "lfo2_to_vcf":
+            if f.key == "lfo2_to_vcf":
                 self._create_filter_block_slider(mod_lay, f, "LFO 2 Mod Depth")
 
         # Mirrored Keytrack and Velocity (Synced with Oscillators tab)
@@ -2099,25 +2100,35 @@ class App(QMainWindow):
     def _link_sliders(
         self, slider_a: QSlider, rd_a: QLabel, slider_b: QSlider, rd_b: QLabel
     ) -> None:
-        """Bidirectionally binds two QSliders and their readouts without recursive loops."""
+        """Bidirectionally binds two QSliders without infinite recursion or dropped transmissions."""
+        syncing = False
+
         def on_a_changed(val: int) -> None:
-            slider_b.blockSignals(True)
-            slider_b.setValue(val)
-            slider_b.blockSignals(False)
-            rd_a.setText(str(val))
-            rd_b.setText(str(val))
+            nonlocal syncing
+            if syncing:
+                return
+            syncing = True
+            try:
+                slider_b.setValue(val)
+                rd_a.setText(str(val))
+                rd_b.setText(str(val))
+            finally:
+                syncing = False
 
         def on_b_changed(val: int) -> None:
-            slider_a.blockSignals(True)
-            slider_a.setValue(val)
-            slider_a.blockSignals(False)
-            rd_a.setText(str(val))
-            rd_b.setText(str(val))
+            nonlocal syncing
+            if syncing:
+                return
+            syncing = True
+            try:
+                slider_a.setValue(val)
+                rd_a.setText(str(val))
+                rd_b.setText(str(val))
+            finally:
+                syncing = False
 
         slider_a.valueChanged.connect(on_a_changed)
         slider_b.valueChanged.connect(on_b_changed)
-
-        # Pull initial state from primary (B) into secondary (A)
         on_b_changed(slider_b.value())
 
     def _wire_cross_panel_sync(self) -> None:
@@ -3916,11 +3927,13 @@ class App(QMainWindow):
             if isinstance(w, QSlider):
                 return w.value()
             if isinstance(w, QComboBox):
-                return w.currentData()
+                cd = w.currentData()
+                return cd if cd is not None else w.currentIndex()
             if isinstance(w, QCheckBox):
                 return 1 if w.isChecked() else 0
             if isinstance(w, QPushButton) and w.isCheckable():
                 return 1 if w.isChecked() else 0
+            return p.default
 
         slot = presets.defaults_slot(
             name or self.preset_name_entry.text().strip() or "Untitled"
@@ -3961,9 +3974,9 @@ class App(QMainWindow):
         finally:
             self._preset_loading = False
 
+        # Refresh all dynamic previews with new patch values
         if hasattr(self, "_mod_slot_dots") and self._mod_slot_dots:
             self._update_all_mod_indicators()
-
         if hasattr(self, "_lfo1_preview") and hasattr(self, "_lfo1_combo"):
             self._lfo1_preview.set_waveform(self._lfo1_combo.currentText())
         if hasattr(self, "_lfo2_preview") and hasattr(self, "_lfo2_combo"):
@@ -3974,6 +3987,9 @@ class App(QMainWindow):
             self._update_vcf_preview()
         if hasattr(self, "_pwm_preview"):
             self._update_pwm_preview()
+        if hasattr(self, "_wave_buttons"):
+            for btn in self._wave_buttons.values():
+                self._style_wave_button(btn, btn.isChecked())
 
         self._refresh_dirty()
         if persist_current:
@@ -4011,6 +4027,8 @@ class App(QMainWindow):
             idx = w.findData(val)
             if idx != -1:
                 w.setCurrentIndex(idx)
+            elif 0 <= val < w.count():
+                w.setCurrentIndex(val)
         elif isinstance(w, QCheckBox):
             w.setChecked(bool(val))
         elif isinstance(w, QPushButton) and w.isCheckable():
@@ -4308,15 +4326,20 @@ class App(QMainWindow):
             if isinstance(w, QSlider):
                 val = w.value()
             elif isinstance(w, QComboBox):
-                val = w.currentData()
+                cd = w.currentData()
+                val = cd if cd is not None else (w.currentIndex() if w.currentIndex() >= 0 else p.default)
             elif isinstance(w, QCheckBox):
                 val = 1 if w.isChecked() else 0
             elif isinstance(w, QPushButton) and w.isCheckable():
                 val = 1 if w.isChecked() else 0
 
+            self.queue_param(p.pid, val)
+            n += 1
+
         for block in presets.patch_blocks():
             self.queue_block(block.key)
             n += 1
+
         self._flush()
 
         if screen:
