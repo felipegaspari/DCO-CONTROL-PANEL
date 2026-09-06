@@ -20,6 +20,15 @@ import models
 import param_meta
 import protocol
 
+def _read_project_config_macro(name: str, fallback: int) -> int:
+    """Read an integer macro definition from project_config.h in the parent directory."""
+    header = Path(__file__).resolve().parent.parent / "project_config.h"
+    try:
+        text = header.read_text()
+    except OSError:
+        return fallback
+    m = re.search(rf"^\s*#\s*define\s+{name}\s+(\d+)", text, re.M)
+    return int(m.group(1)) if m else fallback
 
 def _range_pwm_wrap() -> int:
     """RANGE_PWM_WRAP from the superproject; 14000 if the header is missing."""
@@ -33,8 +42,14 @@ def _range_pwm_wrap() -> int:
 
 
 RANGE_PWM_WRAP = _range_pwm_wrap()
-AMP_COMP_440_MIN = RANGE_PWM_WRAP // 20
-AMP_COMP_440_MAX = RANGE_PWM_WRAP // 5
+AMP_COMP_440_MIN = RANGE_PWM_WRAP // 18
+AMP_COMP_440_MAX = RANGE_PWM_WRAP // 4
+
+# --- Pulse Width PWM Wrap from project_config.h ---
+PW_PWM_WRAP = _read_project_config_macro("PW_PWM_WRAP", 2047)
+PW_CENTER_CAL_MIN = 0
+PW_CENTER_CAL_MAX = PW_PWM_WRAP
+PW_CENTER_CAL_DEFAULT = PW_PWM_WRAP // 2
 
 # Tab names, in display order.
 GROUP_OSC = "Oscillators"
@@ -220,7 +235,7 @@ PARAMS: list[Param] = [
     Param(3, "OSC1 Tri enable", GROUP_OSC, "check", default=0, cc=18),
     Param(87, "OSC2 Saw enable", GROUP_OSC, "check", default=0, cc=112),
     Param(88, "OSC2 Pulse enable", GROUP_OSC, "check", default=0, cc=113),
-    Param(89, "OSC2 Tri enable", GROUP_OSC, "check", default=0, cc=114),
+    Param(89, "OSC2 Tri enable", GROUP_OSC, "check", default=0, cc=114, models=("dco3",)),
     Param(90, "OSC3 Saw enable", GROUP_OSC, "check", default=0, cc=115),
     Param(91, "OSC3 Pulse enable", GROUP_OSC, "check", default=0, cc=116),
     Param(92, "OSC3 Tri enable", GROUP_OSC, "check", default=0, cc=117),
@@ -328,10 +343,11 @@ PARAMS: list[Param] = [
     Param(150, "Run calibration", GROUP_CAL, "pulse", pulse_value=CAL_SCOPE_FULL),
     Param(151, "Manual calibration mode", GROUP_CAL, "check", default=0),
     Param(152, "Manual cal stage", GROUP_CAL, "slider", 0, 8, 0),
-    Param(153, "Manual cal offset", GROUP_CAL, "slider", -20, 20, 0),
+    Param(153, "Manual cal offset", GROUP_CAL, "slider", -40, 50, 0),
     Param(159, "Amp comp @ 440 Hz", GROUP_CAL, "slider",
           AMP_COMP_440_MIN, AMP_COMP_440_MAX, AMP_COMP_440_MIN),
-    Param(162, "PW center (cal)", GROUP_CAL, "slider", 0, 1023, 512),
+    Param(162, "PW center (cal)", GROUP_CAL, "slider",
+          PW_CENTER_CAL_MIN, PW_CENTER_CAL_MAX, PW_CENTER_CAL_DEFAULT),
     Param(161, "Duty trim (0.01%)", GROUP_CAL, "slider", -500, 500, 0),
     Param(156, "Store manual cal offsets", GROUP_CAL, "pulse", pulse_value=1),
 ]
@@ -378,6 +394,8 @@ BLOCKS: list[Block] = [
 DEBUG_COMMANDS = (
     ("PIO topology report", 1),
     ("Sub-osc engine report", 4),
+    ("PWM DMA Report", 5),
+    ("MCU DMA Channel Map", 6),
     ("Period probe, clk_div 2000", 2),
     ("Period probe, clk_div 20000", 3),
     ("Dump RAM (heap/stack)", 13),

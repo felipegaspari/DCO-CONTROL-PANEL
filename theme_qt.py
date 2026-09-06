@@ -2,30 +2,31 @@
 
 from __future__ import annotations
 
-# Set your preferred default theme here:
-# Options: "monokai", "dark", "cyberpunk", "solarized_light", "github_light", "light"
+# Default theme: "monokai", "dark", "cyberpunk", "solarized_light", "github_light", "light"
 DEFAULT_THEME = "monokai"
 
 # --- Palettes ---
 
 DARK_PALETTE = {
     "name": "Dark (Studio)",
-    "bg": "#181a1f",
-    "surface": "#22262e",
-    "surface_alt": "#2c313c",
-    "border": "#363c48",
-    "fg": "#dbe0e8",
-    "muted": "#7c8594",
+    "bg": "#16181d",
+    "surface": "#20242c",
+    "surface_alt": "#282e38",
+    "border": "#353b47",
+    "border_hover": "#4a5364",
+    "fg": "#e6ebf2",
+    "label": "#b8c1cf",         # Crisp medium-contrast parameter label
+    "muted": "#758092",
     "accent": "#3b82f6",
     "accent_hover": "#60a5fa",
     "accent_active": "#2563eb",
     "accent_text": "#ffffff",
-    "field": "#121418",
-    "slider_trough": "#282c34",
+    "field": "#111317",
+    "slider_trough": "#262b34",
     "slider_fill": "#3b82f6",
     "ok": "#10b981",
-    "off": "#4b5563",
-    "log_bg": "#0f1115",
+    "off": "#475161",
+    "log_bg": "#0d0f12",
 }
 
 LIGHT_PALETTE = {
@@ -34,38 +35,42 @@ LIGHT_PALETTE = {
     "surface": "#ffffff",
     "surface_alt": "#e2e8f0",
     "border": "#cbd5e1",
+    "border_hover": "#94a3b8",
     "fg": "#0f172a",
+    "label": "#334155",
     "muted": "#64748b",
     "accent": "#2563eb",
     "accent_hover": "#3b82f6",
     "accent_active": "#1d4ed8",
     "accent_text": "#ffffff",
-    "field": "#ffffff",
+    "field": "#f8fafc",
     "slider_trough": "#cbd5e1",
     "slider_fill": "#2563eb",
     "ok": "#16a34a",
     "off": "#94a3b8",
-    "log_bg": "#f8fafc",
+    "log_bg": "#ffffff",
 }
 
 MONOKAI_PALETTE = {
     "name": "Monokai Pro",
-    "bg": "#272822",
-    "surface": "#383830",
-    "surface_alt": "#49483e",
-    "border": "#595744",
+    "bg": "#22231e",
+    "surface": "#32332c",
+    "surface_alt": "#42433a",
+    "border": "#545548",
+    "border_hover": "#75715e",
     "fg": "#f8f8f2",
+    "label": "#dcdcd4",
     "muted": "#75715e",
     "accent": "#a6e22e",        # Neon Green
     "accent_hover": "#b8f33f",
     "accent_active": "#f92672", # Magenta
-    "accent_text": "#272822",
-    "field": "#1e1f1c",
-    "slider_trough": "#49483e",
+    "accent_text": "#22231e",
+    "field": "#181915",
+    "slider_trough": "#42433a",
     "slider_fill": "#a6e22e",
     "ok": "#a6e22e",
-    "off": "#75715e",
-    "log_bg": "#1e1f1c",
+    "off": "#605d4e",
+    "log_bg": "#181915",
 }
 
 SOLARIZED_LIGHT_PALETTE = {
@@ -74,13 +79,15 @@ SOLARIZED_LIGHT_PALETTE = {
     "surface": "#eee8d5",
     "surface_alt": "#e0d7be",
     "border": "#cbbf9e",
+    "border_hover": "#93a1a1",
     "fg": "#586e75",
+    "label": "#40545b",
     "muted": "#93a1a1",
     "accent": "#268bd2",        # Solarized Blue
     "accent_hover": "#2aa198",  # Solarized Cyan
     "accent_active": "#cb4b16", # Solarized Orange
     "accent_text": "#ffffff",
-    "field": "#fffdf8",
+    "field": "#fbf3de",
     "slider_trough": "#dcd4bb",
     "slider_fill": "#268bd2",
     "ok": "#859900",            # Solarized Green
@@ -94,13 +101,15 @@ GITHUB_LIGHT_PALETTE = {
     "surface": "#f6f8fa",
     "surface_alt": "#eaeef2",
     "border": "#d0d7de",
+    "border_hover": "#8c959f",
     "fg": "#24292f",
+    "label": "#363c44",
     "muted": "#57606a",
     "accent": "#0969da",
     "accent_hover": "#218bff",
     "accent_active": "#0550ae",
     "accent_text": "#ffffff",
-    "field": "#ffffff",
+    "field": "#f6f8fa",
     "slider_trough": "#d0d7de",
     "slider_fill": "#0969da",
     "ok": "#1a7f37",
@@ -110,22 +119,24 @@ GITHUB_LIGHT_PALETTE = {
 
 CYBERPUNK_PALETTE = {
     "name": "Cyberpunk Neon",
-    "bg": "#14121e",
-    "surface": "#1e1930",
-    "surface_alt": "#2c2448",
-    "border": "#4c3a70",
-    "fg": "#e2d9f3",
-    "muted": "#8471a5",
+    "bg": "#12101b",
+    "surface": "#1b172b",
+    "surface_alt": "#27213d",
+    "border": "#463666",
+    "border_hover": "#6c539e",
+    "fg": "#e5ddf5",
+    "label": "#cbbee5",
+    "muted": "#7f6a9f",
     "accent": "#ff007f",        # Hot Pink
     "accent_hover": "#ff409f",
     "accent_active": "#00f0ff", # Neon Cyan
     "accent_text": "#ffffff",
-    "field": "#0c0a14",
-    "slider_trough": "#2c2448",
+    "field": "#0b0912",
+    "slider_trough": "#27213d",
     "slider_fill": "#00f0ff",
     "ok": "#00f0ff",
-    "off": "#574878",
-    "log_bg": "#0c0a14",
+    "off": "#50416f",
+    "log_bg": "#0b0912",
 }
 
 PALETTES = {
@@ -141,28 +152,35 @@ PALETTES = {
 def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
     p = PALETTES.get(mode, PALETTES[DEFAULT_THEME])
 
-    # Dynamic sizes calculated relative to base font size
+    # Dynamic sizes relative to base font size
     f_main = base_size
     f_small = max(9, base_size - 1)
     f_heading = base_size + 1
-    
-    tab_pad_v = max(4, int(base_size * 0.6))
-    tab_pad_h = max(8, int(base_size * 1.1))
-    btn_pad_v = max(3, int(base_size * 0.4))
-    btn_pad_h = max(8, int(base_size * 0.9))
-    input_pad_v = max(2, int(base_size * 0.35))
-    input_pad_h = max(6, int(base_size * 0.65))
 
-    groove_h = max(4, int(base_size * 0.5))
-    handle_w = max(12, int(base_size * 1.15))
+    tab_pad_v = max(4, int(base_size * 0.55))
+    tab_pad_h = max(8, int(base_size * 1.0))
+    btn_pad_v = max(3, int(base_size * 0.4))
+    btn_pad_h = max(8, int(base_size * 0.85))
+    input_pad_v = max(3, int(base_size * 0.35))
+    input_pad_h = max(8, int(base_size * 0.75))
+
+    groove_h = max(4, int(base_size * 0.45))
+    handle_w = max(12, int(base_size * 1.1))
     handle_m = -int((handle_w - groove_h) / 2)
     handle_rad = int(handle_w / 2)
 
+    # URL-encoded hex colors for SVG chevron vector
+    p_muted_enc = p["muted"].replace("#", "%23")
+    p_accent_enc = p["accent"].replace("#", "%23")
+    p_label = p.get("label", p["fg"])
+    p_border_hover = p.get("border_hover", p["accent"])
+
     return f"""
+    /* Global Application Typography */
     QWidget {{
         background-color: {p["bg"]};
         color: {p["fg"]};
-        font-family: "Inter", "Segoe UI", "Noto Sans", sans-serif;
+        font-family: "Inter", "Segoe UI Variable Text", "SF Pro Text", -apple-system, "Segoe UI", "Noto Sans", sans-serif;
         font-size: {f_main}px;
         selection-background-color: {p["accent"]};
         selection-color: {p["accent_text"]};
@@ -184,7 +202,7 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
     QTabWidget::pane {{
         border: 1px solid {p["border"]};
         background: {p["surface"]};
-        border-radius: 4px;
+        border-radius: 5px;
     }}
     QTabBar::tab {{
         background: {p["bg"]};
@@ -199,7 +217,7 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
     QTabBar::tab:selected {{
         background: {p["surface"]};
         color: {p["accent"]};
-        font-weight: bold;
+        font-weight: 600;
         border-top: 2px solid {p["accent"]};
     }}
     QTabBar::tab:hover:!selected {{
@@ -207,14 +225,14 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
         color: {p["fg"]};
     }}
 
-    /* Group Boxes */
+    /* Hardware Faceplate Group Boxes */
     QGroupBox {{
         background-color: {p["surface"]};
         border: 1px solid {p["border"]};
         border-radius: 6px;
-        margin-top: {int(f_main * 1.4)}px;
-        padding-top: {int(f_main * 1.1)}px;
-        font-weight: bold;
+        margin-top: {int(f_main * 1.35)}px;
+        padding-top: {int(f_main * 0.9)}px;
+        font-weight: 600;
         font-size: {f_heading}px;
     }}
     QGroupBox::title {{
@@ -223,6 +241,9 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
         padding: 0 6px;
         color: {p["accent"]};
         background-color: transparent;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
     }}
 
     /* Push Buttons */
@@ -252,36 +273,97 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
         background-color: {p["accent"]};
         color: {p["accent_text"]};
         border: none;
-        font-weight: bold;
+        font-weight: 600;
     }}
     QPushButton#AccentButton:hover {{
         background-color: {p["accent_hover"]};
     }}
 
-    /* Inputs */
-    QComboBox, QLineEdit, QSpinBox {{
+    /* Modern Audio-Plugin Style Dropdowns (QComboBox) */
+    QComboBox {{
+        background-color: {p["field"]};
+        border: 1px solid {p["border"]};
+        border-radius: 5px;
+        padding: {input_pad_v}px 26px {input_pad_v}px {input_pad_h}px;
+        color: {p["fg"]};
+        font-size: {f_main}px;
+        font-weight: 500;
+        min-height: {int(f_main * 1.55)}px;
+    }}
+    QComboBox:hover {{
+        background-color: {p["surface_alt"]};
+        border-color: {p_border_hover};
+    }}
+    QComboBox:focus, QComboBox:on {{
+        border: 1px solid {p["accent"]};
+        background-color: {p["field"]};
+    }}
+    QComboBox:disabled {{
+        background-color: {p["bg"]};
+        border-color: {p["border"]};
+        color: {p["muted"]};
+    }}
+
+    /* Dropdown Chevron Arrow (Vector SVG) */
+    QComboBox::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: center right;
+        width: 22px;
+        border: none;
+        background: transparent;
+    }}
+    QComboBox::down-arrow {{
+        image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1L5 5L9 1' stroke='{p_muted_enc}' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/></svg>");
+        width: 10px;
+        height: 6px;
+        margin-right: 6px;
+    }}
+    QComboBox::down-arrow:hover, QComboBox::down-arrow:on {{
+        image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1L5 5L9 1' stroke='{p_accent_enc}' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/></svg>");
+    }}
+
+    /* Floating Menu Popup (QAbstractItemView) */
+    QComboBox QAbstractItemView {{
+        background-color: {p["surface"]};
+        border: 1px solid {p["border"]};
+        border-radius: 6px;
+        padding: 4px;
+        outline: 0;
+        selection-background-color: {p["accent"]};
+        selection-color: {p["accent_text"]};
+    }}
+    QComboBox QAbstractItemView::item {{
+        min-height: {int(f_main * 1.75)}px;
+        padding: 4px 8px;
+        border-radius: 4px;
+        color: {p["fg"]};
+        font-size: {f_main}px;
+    }}
+    QComboBox QAbstractItemView::item:hover {{
+        background-color: {p["surface_alt"]};
+        color: {p["fg"]};
+    }}
+    QComboBox QAbstractItemView::item:selected {{
+        background-color: {p["accent"]};
+        color: {p["accent_text"]};
+        font-weight: 600;
+    }}
+
+    /* LineEdit and SpinBox */
+    QLineEdit, QSpinBox {{
         background-color: {p["field"]};
         border: 1px solid {p["border"]};
         border-radius: 4px;
         padding: {input_pad_v}px {input_pad_h}px;
         color: {p["fg"]};
         font-size: {f_main}px;
+        font-weight: 500;
     }}
-    QComboBox:focus, QLineEdit:focus, QSpinBox:focus {{
+    QLineEdit:focus, QSpinBox:focus {{
         border: 1px solid {p["accent"]};
     }}
-    QComboBox::drop-down {{
-        border: none;
-        width: 20px;
-    }}
-    QComboBox QAbstractItemView {{
-        background-color: {p["surface"]};
-        border: 1px solid {p["border"]};
-        selection-background-color: {p["accent"]};
-        selection-color: {p["accent_text"]};
-    }}
 
-    /* Sliders */
+    /* Parameter Sliders */
     QSlider::groove:horizontal {{
         height: {groove_h}px;
         background: {p["slider_trough"]};
@@ -326,7 +408,7 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
     /* Scrollbars */
     QScrollBar:vertical {{
         background: {p["bg"]};
-        width: {max(8, int(base_size * 0.8))}px;
+        width: {max(8, int(base_size * 0.75))}px;
         margin: 0;
     }}
     QScrollBar::handle:vertical {{
@@ -341,25 +423,39 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
         height: 0;
     }}
 
-    /* Log Output / PlainTextEdit */
+    /* Monospaced Log Output */
     QPlainTextEdit#LogView {{
         background-color: {p["log_bg"]};
         color: {p["fg"]};
         border: 1px solid {p["border"]};
         border-radius: 4px;
-        font-family: "JetBrains Mono", "Fira Code", "Noto Sans Mono", monospace;
+        font-family: "JetBrains Mono", "SF Mono", "Fira Code", "Noto Sans Mono", monospace;
         font-size: {f_small}px;
     }}
 
-    /* Labels */
-    QLabel#ReadoutLabel {{
-        color: {p["muted"]};
-        font-family: "JetBrains Mono", "Fira Code", "Noto Sans Mono", monospace;
-        font-size: {f_small}px;
-        font-weight: bold;
+    /* Parameter Labels Hierarchy */
+    QLabel {{
+        color: {p_label};
+        font-weight: 500;
+        letter-spacing: 0.25px;
     }}
+
+    /* Digital OLED/LCD Style Readout Pill Badges */
+    QLabel#ReadoutLabel {{
+        color: {p["fg"]};
+        background-color: {p["field"]};
+        border: 1px solid {p["border"]};
+        border-radius: 3px;
+        padding: 1px 4px;
+        font-family: "JetBrains Mono", "SF Mono", "Fira Code", "Cascadia Code", "Consolas", monospace;
+        font-size: {f_small}px;
+        font-weight: 600;
+    }}
+
+    /* Subtle Notes / Secondary Headers */
     QLabel#MutedLabel {{
         color: {p["muted"]};
         font-size: {f_small}px;
+        font-weight: 400;
     }}
     """

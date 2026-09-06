@@ -143,4 +143,7 @@ def format_display_value(pid: int, val: int) -> str:
         return f"{scaled:+d}"
     if pid == 46:
         return f"{scaled:+d}"
+    # Modulation Matrix depths (Slots 0..7: PIDs 65, 68, 71, 74, 77, 80, 83, 86)
+    if 65 <= pid <= 86 and (pid - 65) % 3 == 0:
+        return f"{scaled:+d}" if scaled != 0 else "0"
     return str(scaled)
