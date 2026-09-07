@@ -14,10 +14,12 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QIcon,
     QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QTextCharFormat,
     QTextCursor,
 )
@@ -73,7 +75,7 @@ PARAM_BY_PID = {p.pid: p for p in params.PARAMS}
 
 # Layout constants
 OSC_PITCH_PIDS = (13, 14, 34, 15, 35)
-OSC_SYNC_PIDS = (32, 37, 38, 17, 130,)
+OSC_SYNC_PIDS = (32, 37, 38, 17, 130, 131)
 OSC_VOICE_PIDS = (26, 27, 28, 18, 33, 29, 30, 31, 43, 21)
 OSC_LEVEL_PIDS = (22, 23, 39, 24)
 OSC_WAVE_MATRIX = [
@@ -677,6 +679,100 @@ class LFOWaveformPreview(QWidget):
 
         painter.drawPath(path)
 
+class CrossmodModeSelector(QWidget):
+    """Dynamic selector matching the exact styling of the Saw, Pulse, and Tri buttons."""
+    modeChanged = Signal(int)
+
+    def __init__(self, app: App, choices: tuple[tuple[str, int], ...], default_val: int = 0, parent=None) -> None:
+        super().__init__(parent)
+        self.app = app
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        self.buttons: dict[int, QPushButton] = {}
+        palette = theme.PALETTES.get(app.mode, theme.PALETTES[theme.DEFAULT_THEME])
+
+        for raw_label, val in choices:
+            clean_name = raw_label.split(" - ", 1)[-1].strip()
+            name_lower = clean_name.lower()
+
+            if "center" in name_lower:
+                mode_type = "center"
+            elif "lin" in name_lower:
+                mode_type = "lin"
+            else:  # Vintage / Exp
+                mode_type = "exp"
+
+            btn = QPushButton(clean_name)
+            btn.setCheckable(True)
+            btn.setIcon(self._make_curve_icon(mode_type, palette))
+            btn.clicked.connect(lambda _, v=val: self.setValue(v))
+
+            lay.addWidget(btn, 1)
+            self.buttons[val] = btn
+
+        self.setValue(default_val)
+
+    def _make_curve_icon(self, mode: str, palette: dict) -> QIcon:
+        """Generates clean vector icons matching active and muted button states."""
+        icon = QIcon()
+        for checked, col_key in ((False, "muted"), (True, "bg")):
+            pix = QPixmap(16, 14)
+            pix.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor(palette[col_key]), 2.0))
+
+            path = QPainterPath()
+            if mode == "center":
+                # Centered: clean horizontal line
+                path.moveTo(2, 7)
+                path.lineTo(14, 7)
+            elif mode == "exp":
+                # Vintage: exponential curve accelerating upward
+                path.moveTo(2, 12)
+                path.cubicTo(7, 12, 11, 7, 14, 2)
+            else:
+                # Linear: straight 45-degree diagonal ramp
+                path.moveTo(2, 12)
+                path.lineTo(14, 2)
+
+            painter.drawPath(path)
+            painter.end()
+            icon.addPixmap(pix, QIcon.Mode.Normal, QIcon.State.On if checked else QIcon.State.Off)
+        return icon
+
+    def refresh_theme(self) -> None:
+        palette = theme.PALETTES.get(self.app.mode, theme.PALETTES[theme.DEFAULT_THEME])
+        for val, btn in self.buttons.items():
+            name_lower = btn.text().lower()
+            if "center" in name_lower:
+                mode_type = "center"
+            elif "lin" in name_lower:
+                mode_type = "lin"
+            else:
+                mode_type = "exp"
+
+            btn.setIcon(self._make_curve_icon(mode_type, palette))
+            self.app._style_wave_button(btn, btn.isChecked())
+
+    def value(self) -> int:
+        for val, btn in self.buttons.items():
+            if btn.isChecked():
+                return val
+        return 0
+
+    def setValue(self, val: int) -> None:
+        for v, btn in self.buttons.items():
+            is_active = (v == val)
+            btn.blockSignals(True)
+            btn.setChecked(is_active)
+            self.app._style_wave_button(btn, is_active)
+            btn.blockSignals(False)
+        self.modeChanged.emit(val)
+
+
 class App(QMainWindow):
     def __init__(
         self,
@@ -813,6 +909,10 @@ class App(QMainWindow):
          accent_col = QColor(theme.PALETTES[self.mode]["accent"])
          self._filter_preview.set_color(accent_col)
          self._pwm_preview.set_color(accent_col)
+
+        w131 = self.param_widgets.get(131)
+        if isinstance(w131, CrossmodModeSelector):
+            w131.refresh_theme()
 
     def _on_theme_selected(self, index: int) -> None:
         key = self.theme_combo.itemData(index)
@@ -2032,7 +2132,21 @@ class App(QMainWindow):
 
         if 130 in PARAM_BY_PID:
             self._create_osc_slider_row(sync_lay, 130, "Crossmod Depth", reset_val=0)
+        if 131 in PARAM_BY_PID:
+            p131 = PARAM_BY_PID[131]
+            row_cm = QHBoxLayout()
+            row_cm.setSpacing(4)
+            lbl_cm = QLabel("Crossmod Mode:")
+            lbl_cm.setFixedWidth(110)
+            row_cm.addWidget(lbl_cm)
 
+            selector131 = CrossmodModeSelector(self, p131.choices, p131.default)
+            selector131.modeChanged.connect(
+                lambda val, pid=131: self._on_combo_changed(pid, val)
+            )
+            row_cm.addWidget(selector131, 1)
+            sync_lay.addLayout(row_cm)
+            self.param_widgets[131] = selector131
         sync_lay.addStretch(1)
         row_sync_drift.addWidget(sync_box, 1)
 
@@ -2098,37 +2212,27 @@ class App(QMainWindow):
         parent_layout.addStretch(1)
 
     def _link_sliders(
-        self, slider_a: QSlider, rd_a: QLabel, slider_b: QSlider, rd_b: QLabel
+        self, slider_a: QSlider, rd_a: QLabel, slider_b: QSlider, rd_b: QLabel, pid: int | None = None
     ) -> None:
-        """Bidirectionally binds two QSliders without infinite recursion or dropped transmissions."""
-        syncing = False
+        """Bidirectionally binds two QSliders and their readouts without recursive loops."""
+        def fmt(v: int) -> str:
+            return param_meta.format_display_value(pid, v) if pid is not None else str(v)
 
         def on_a_changed(val: int) -> None:
-            nonlocal syncing
-            if syncing:
-                return
-            syncing = True
-            try:
+            rd_a.setText(fmt(val))
+            rd_b.setText(fmt(val))
+            if slider_b.value() != val:
                 slider_b.setValue(val)
-                rd_a.setText(str(val))
-                rd_b.setText(str(val))
-            finally:
-                syncing = False
 
         def on_b_changed(val: int) -> None:
-            nonlocal syncing
-            if syncing:
-                return
-            syncing = True
-            try:
+            rd_a.setText(fmt(val))
+            rd_b.setText(fmt(val))
+            if slider_a.value() != val:
                 slider_a.setValue(val)
-                rd_a.setText(str(val))
-                rd_b.setText(str(val))
-            finally:
-                syncing = False
 
         slider_a.valueChanged.connect(on_a_changed)
         slider_b.valueChanged.connect(on_b_changed)
+
         on_b_changed(slider_b.value())
 
     def _wire_cross_panel_sync(self) -> None:
@@ -2150,7 +2254,7 @@ class App(QMainWindow):
         primary_pwm = self.param_widgets.get(46)
         rd_pwm = self._readouts.get(("p", 46))
         if hasattr(self, "_env_pwm_slider") and isinstance(primary_pwm, QSlider) and rd_pwm:
-            self._link_sliders(self._env_pwm_slider, self._env_pwm_rd, primary_pwm, rd_pwm)
+            self._link_sliders(self._env_pwm_slider, self._env_pwm_rd, primary_pwm, rd_pwm, pid=46)
 
         # 4. LFO 2 -> Filter (Cutoff Mod -> lfo2_to_vcf)
         primary_lfo_vcf = filter_widgets.get("lfo2_to_vcf")
@@ -2351,7 +2455,7 @@ class App(QMainWindow):
 
                 # Cross-linked to PWM Tab -> ADSR3 to PWM [PID 46]
                 self._env_pwm_slider, self._env_pwm_rd = self._create_mirrored_slider_row(
-                    mod_lay, "PWM Depth", 0, 1023, 512
+                    mod_lay, "PWM Depth", 0, 1023, 512, pid=46
                 )
 
             lay.addWidget(mod_box)
@@ -2386,205 +2490,6 @@ class App(QMainWindow):
         mode = mode_cb.currentData() if isinstance(mode_cb, QComboBox) else 0
 
         self._env_previews[bkey].set_values(a, d, s, r, mode)
-
-    def _update_all_env_previews(self) -> None:
-        for bkey in ("adsr_vca", "adsr_vcf", "adsr_dco"):
-            self._update_env_preview(bkey)
-        for bkey in ("adsr_vca", "adsr_vcf", "adsr_dco"):
-            self._update_env_preview(bkey)
-        palette = theme.PALETTES.get(self.mode, theme.PALETTES[theme.DEFAULT_THEME])
-        accent_col = QColor(palette["accent"])
-
-        columns_layout = QHBoxLayout()
-        columns_layout.setSpacing(10)
-
-        self._env_previews: dict[str, EnvelopePreviewWidget] = {}
-
-        # Envelope strip definitions:
-        # (bkey, title, mode_pid, a_curve, d_curve, r_curve, restart_pid)
-        env_specs = [
-            ("adsr_vca", "EnvVCA (ADSR 1) — Amplitude", 224, 48, 49, 50, 8),
-            ("adsr_vcf", "EnvVCF (ADSR 2) — Filter Timbre", 225, 51, 52, 53, 9),
-            ("adsr_dco", "EnvDCO (ADSR 3) — Pitch & PWM", 223, 54, 55, 56, 214),
-        ]
-
-        for bkey, title, mode_pid, a_pid, d_pid, rel_pid, r_pid in env_specs:
-            block = self.blocks_by_key[bkey]
-            box = QGroupBox(title)
-            lay = QVBoxLayout(box)
-            lay.setSpacing(8)
-
-            # Special Header Toggle for EnvDCO enable
-            if bkey == "adsr_dco" and 126 in PARAM_BY_PID:
-                en_p = PARAM_BY_PID[126]
-                en_chk = QCheckBox("Enable EnvDCO")
-                en_chk.setChecked(bool(en_p.default))
-                en_chk.toggled.connect(
-                    lambda checked, pid=126: self._on_check_toggled(pid, checked)
-                )
-                lay.addWidget(en_chk)
-                self.param_widgets[126] = en_chk
-
-            # 1. Live Vector Preview
-            prev = EnvelopePreviewWidget(accent_col)
-            lay.addWidget(prev)
-            self._env_previews[bkey] = prev
-
-            # 2. ADSR Vertical Faders
-            faders_box = QGroupBox("Stages (ADSR)")
-            faders_lay = QHBoxLayout(faders_box)
-            faders_lay.setContentsMargins(4, 8, 4, 8)
-            faders_lay.setSpacing(6)
-            self.block_widgets[bkey] = {}
-
-            for f in block.fields:
-                col = QVBoxLayout()
-                col.setSpacing(4)
-                lbl = QLabel(f.label[0].upper())  # 'A', 'D', 'S', 'R'
-                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                lbl.setStyleSheet("font-weight: bold;")
-                col.addWidget(lbl)
-
-                slider = QSlider(Qt.Orientation.Vertical)
-                slider.setRange(f.lo, f.hi)
-                slider.setValue(f.default)
-                slider.setMinimumHeight(120)
-
-                rd = QLabel(str(f.default))
-                rd.setObjectName("ReadoutLabel")
-                rd.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                slider.valueChanged.connect(
-                    lambda val, bk=bkey, fk=f.key, r=rd: self._on_env_slider_changed(
-                        bk, fk, val, r
-                    )
-                )
-
-                col.addWidget(slider, 1, Qt.AlignmentFlag.AlignCenter)
-                col.addWidget(rd, 0, Qt.AlignmentFlag.AlignCenter)
-                faders_lay.addLayout(col)
-
-                self.block_widgets[bkey][f.key] = slider
-                self._readouts[("b", bkey, f.key)] = rd
-
-            lay.addWidget(faders_box)
-
-            # 3. Shape & Response (Mode, Curves, Restart)
-            shape_box = QGroupBox("Shape & Curves")
-            shape_lay = QVBoxLayout(shape_box)
-            shape_lay.setSpacing(4)
-
-            # Mode
-            if mode_pid in PARAM_BY_PID:
-                mp = PARAM_BY_PID[mode_pid]
-                m_row = QHBoxLayout()
-                m_row.addWidget(QLabel("Mode:"))
-                mcb = QComboBox()
-                for label, val in mp.choices:
-                    mcb.addItem(label, val)
-                mcb.setCurrentIndex(
-                    next((i for i, c in enumerate(mp.choices) if c[1] == mp.default), 0)
-                )
-                mcb.currentIndexChanged.connect(
-                    lambda idx, pid=mp.pid, cb=mcb, bk=bkey: self._on_env_mode_changed(
-                        pid, cb.itemData(idx), bk
-                    )
-                )
-                m_row.addWidget(mcb, 1)
-                shape_lay.addLayout(m_row)
-                self.param_widgets[mp.pid] = mcb
-
-            # Curves Grid (Attack, Decay, Release)
-            grid_curves = QGridLayout()
-            grid_curves.setContentsMargins(0, 2, 0, 2)
-            grid_curves.setSpacing(4)
-
-            for idx_c, (pid, clbl) in enumerate(
-                ((a_pid, "Atk"), (d_pid, "Dec"), (rel_pid, "Rel"))
-            ):
-                if pid in PARAM_BY_PID:
-                    cp = PARAM_BY_PID[pid]
-                    grid_curves.addWidget(QLabel(clbl), 0, idx_c)
-                    cb = QComboBox()
-                    for label, val in cp.choices:
-                        cb.addItem(label, val)
-                    cb.setCurrentIndex(
-                        next((i for i, c in enumerate(cp.choices) if c[1] == cp.default), 0)
-                    )
-                    cb.currentIndexChanged.connect(
-                        lambda c_idx, p=pid, cbox=cb: self._on_combo_changed(
-                            p, cbox.itemData(c_idx)
-                        )
-                    )
-                    grid_curves.addWidget(cb, 1, idx_c)
-                    self.param_widgets[pid] = cb
-
-            shape_lay.addLayout(grid_curves)
-
-            # Restart
-            if r_pid in PARAM_BY_PID:
-                rp = PARAM_BY_PID[r_pid]
-                chk = QCheckBox(rp.label)
-                chk.setChecked(bool(rp.default))
-                chk.toggled.connect(
-                    lambda checked, p=rp.pid: self._on_check_toggled(p, checked)
-                )
-                shape_lay.addWidget(chk)
-                self.param_widgets[rp.pid] = chk
-
-            lay.addWidget(shape_box)
-
-            # 4. Target Modulations / Cross-Panel Links
-            mod_box = QGroupBox("Target Modulations")
-            mod_lay = QVBoxLayout(mod_box)
-            mod_lay.setSpacing(4)
-
-            if bkey == "adsr_vca" and 222 in PARAM_BY_PID:
-                self._create_lfo_slider_row(mod_lay, 222, "VCA Output Level")
-            elif bkey == "adsr_vcf":
-                self._create_synced_slider_row(
-                    mod_lay,
-                    "VCF Cutoff Depth",
-                    0,
-                    512,
-                    self.block_widgets.get("filter", {}).get("adsr2_to_vcf"),
-                )
-            elif bkey == "adsr_dco":
-                if 47 in PARAM_BY_PID:
-                    self._create_lfo_slider_row(mod_lay, 47, "Pitch Detune Depth")
-                if 10 in PARAM_BY_PID:
-                    t_row = QHBoxLayout()
-                    t_row.addWidget(QLabel("Target:"))
-                    top_p = PARAM_BY_PID[10]
-                    t_cb = QComboBox()
-                    for label, val in top_p.choices:
-                        t_cb.addItem(label, val)
-                    t_cb.setCurrentIndex(
-                        next((i for i, c in enumerate(top_p.choices) if c[1] == top_p.default), 0)
-                    )
-                    t_cb.currentIndexChanged.connect(
-                        lambda idx, pid=10, cb=t_cb: self._on_combo_changed(
-                            pid, cb.itemData(idx)
-                        )
-                    )
-                    t_row.addWidget(t_cb, 1)
-                    mod_lay.addLayout(t_row)
-                    self.param_widgets[10] = t_cb
-
-                # Synced PWM envelope slider
-                primary_pwm = self.param_widgets.get(46)
-                if isinstance(primary_pwm, QSlider):
-                    self._create_synced_slider_row(
-                        mod_lay, "PWM Depth", 0, 1023, primary_pwm
-                    )
-
-            lay.addWidget(mod_box)
-            lay.addStretch(1)
-            columns_layout.addWidget(box, 1)
-
-        parent_layout.addLayout(columns_layout)
-        parent_layout.addStretch(1)
-        self._update_all_env_previews()
 
     def _on_env_slider_changed(
         self, bkey: str, fkey: str, value: int, rd: QLabel
@@ -2814,35 +2719,37 @@ class App(QMainWindow):
         return slider
 
     def _create_mirrored_slider_row(
-        self, parent_layout: QVBoxLayout, label_text: str, lo: int, hi: int, default: int = 0
+        self, parent_layout: QVBoxLayout, label_text: str, lo: int, hi: int, default: int = 0, pid: int | None = None
     ) -> tuple[QSlider, QLabel]:
         row = QHBoxLayout()
         row.setContentsMargins(0, 1, 0, 1)
-        row.setSpacing(6)
 
         lbl = QLabel(label_text)
-        lbl.setFixedWidth(175)  # Matches _create_lfo_slider_row exactly
+        lbl.setMinimumWidth(150)
         row.addWidget(lbl)
 
         slider = BipolarSlider(Qt.Orientation.Horizontal)
         slider.setRange(lo, hi)
         slider.setValue(default)
-        slider.setToolTip("Double-click to reset to 0 (synced across tabs)")
+        slider.setToolTip(f"Double-click to reset (default: {default})")
 
-        rd = QLabel(str(default))
+        def fmt(v: int) -> str:
+            return param_meta.format_display_value(pid, v) if pid is not None else str(v)
+
+        rd = QLabel(fmt(default))
         rd.setObjectName("ReadoutLabel")
         rd.setFixedWidth(50)
         rd.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        slider.valueChanged.connect(lambda val, r=rd: r.setText(str(val)))
+        slider.valueChanged.connect(lambda val: rd.setText(fmt(val)))
 
         row.addWidget(slider, 1)
         row.addWidget(rd)
 
         zero_btn = QPushButton("0")
-        zero_btn.setToolTip("Reset to 0")
+        zero_btn.setToolTip("Reset to neutral")
         zero_btn.setFixedWidth(26)
-        zero_btn.clicked.connect(lambda _, s=slider: s.setValue(0))
+        zero_btn.clicked.connect(lambda _, s=slider, d=default: s.setValue(d))
         row.addWidget(zero_btn)
 
         parent_layout.addLayout(row)
@@ -3387,6 +3294,13 @@ class App(QMainWindow):
             )
             row.addWidget(chk, 1)
             self.param_widgets[p.pid] = chk
+        elif p.pid == 131:  # PARAM_CROSSMOD_MODE
+            selector = CrossmodModeSelector(p.choices, p.default)
+            selector.modeChanged.connect(
+                lambda val, pid=p.pid: self._on_combo_changed(pid, val)
+            )
+            row.addWidget(selector, 1)
+            self.param_widgets[p.pid] = selector
         elif p.kind == "pulse":
             if p.pid == PID_RUN_AUTOTUNE:
                 self._add_cal_run_buttons(row, p)
@@ -3933,7 +3847,10 @@ class App(QMainWindow):
                 return 1 if w.isChecked() else 0
             if isinstance(w, QPushButton) and w.isCheckable():
                 return 1 if w.isChecked() else 0
+            if isinstance(w, CrossmodModeSelector):
+                return w.value()
             return p.default
+
 
         slot = presets.defaults_slot(
             name or self.preset_name_entry.text().strip() or "Untitled"
@@ -4035,6 +3952,8 @@ class App(QMainWindow):
             w.setChecked(bool(val))
             if hasattr(self, "_style_wave_button"):
                 self._style_wave_button(w, bool(val))
+        elif isinstance(w, CrossmodModeSelector):
+            w.setValue(val)
 
     def _preset_number_committed(self) -> None:
         idx = self.preset_combo.currentIndex()
@@ -4332,6 +4251,8 @@ class App(QMainWindow):
                 val = 1 if w.isChecked() else 0
             elif isinstance(w, QPushButton) and w.isCheckable():
                 val = 1 if w.isChecked() else 0
+            elif isinstance(w, CrossmodModeSelector):
+                val = w.value()
 
             self.queue_param(p.pid, val)
             n += 1

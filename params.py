@@ -241,6 +241,7 @@ PARAMS: list[Param] = [
     Param(92, "OSC3 Tri enable", GROUP_OSC, "check", default=0, cc=117),
 
     Param(130, "Crossmod depth", GROUP_OSC, "slider", 0, 32767, 0),
+    Param(131, "Crossmod mode", GROUP_OSC, "combo", default=0, choices=param_meta.CROSSMOD_MODES),
 
     # --- Sub-oscillators (ENABLE_SUBOSC_ENGINE2; RP2350 only) ----------------
     Param(93, "Sub 1 divide", GROUP_SUB, "combo", default=0, choices=_SUB_DIVIDES, models=("dco3",)),

@@ -121,6 +121,7 @@ ENV_MODES          = load_enum_choices("param_env_mode_name")
 SYNC_MODES         = load_enum_choices("param_sync_mode_name")
 SOFT_SYNC_MODES    = load_enum_choices("param_soft_sync_mode_name")
 PORTA_MODES        = load_enum_choices("param_portamento_mode_name")
+CROSSMOD_MODES     = load_enum_choices("param_crossmod_mode_name")
 
 def scale_display_value(pid: int, val: int) -> int:
     if pid == 13:  # PARAM_OSC1_INTERVAL
