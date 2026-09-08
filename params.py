@@ -189,6 +189,8 @@ PARAMS: list[Param] = [
     Param(13, "Octave shift", GROUP_OSC, "combo",
           choices=tuple((f"{(s - 36) // 12:+d}", s) for s in range(0, 73, 12)),
           default=24, cc=2),
+    Param(132, "OSC1 detune", GROUP_OSC, "slider", 0, 512, 256),
+    Param(133, "Master detune", GROUP_OSC, "slider", 0, 512, 256),  # <-- ADD THIS
     Param(14, "OSC2 interval (semitones)", GROUP_OSC, "slider", 0, 60, 36, cc=3),
     Param(34, "OSC3 interval (semitones)", GROUP_OSC, "slider", 0, 60, 36, cc=4),
     Param(15, "OSC2 detune", GROUP_OSC, "slider", 0, 512, 256, cc=5),

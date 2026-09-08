@@ -367,98 +367,115 @@ def build_stylesheet(mode: str = DEFAULT_THEME, base_size: int = 12) -> str:
     /* HORIZONTAL SLIDERS (Synth Parameters)                               */
     /* ==================================================================== */
 
-    /* 1. Track / Groove (Thicker by 50%: 6px instead of 4px) */
-    QSlider::groove:horizontal {
+    /* 1. Track / Groove (Slim 4px track) */
+    QSlider::groove:horizontal {{
         border: 1px solid {p['border']};
-        height: 6px;
-        background: {p['field']};
-        border-radius: 3px;
-    }
+        height: 4px;
+        background: {p.get('field', p['bg'])};
+        border-radius: 2px;
+    }}
 
-    QSlider::sub-page:horizontal {
-        background: {p['panel']};
-        border: 1px solid {p['border']};
-        border-radius: 3px;
-    }
-
-    /* 2. Fader Handle / Cap (50% wider: 22px instead of 14px, squared with center line) */
-    QSlider::handle:horizontal {
-        /* Center line drawn via a sharp linear gradient */
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-            stop: 0.00 {p['panel']},
-            stop: 0.43 {p['panel']},
-            stop: 0.45 {p['accent']},
-            stop: 0.55 {p['accent']},
-            stop: 0.57 {p['panel']},
-            stop: 1.00 {p['panel']}
-        );
-        border: 1px solid {p['border']};
-        border-radius: 2px;              /* Squared edges like a mixer fader */
-        width: 22px;                      /* 50% wider than standard 14px */
-        margin-top: -8px;                 /* Centers cap over 6px groove (height becomes 22px) */
-        margin-bottom: -8px;
-    }
-
-    QSlider::handle:horizontal:hover {
+    /* 2. Highlighted Active Track (Fills with theme accent as you slide) */
+    QSlider::sub-page:horizontal {{
+        background: {p['accent']};
         border: 1px solid {p['accent']};
+        height: 4px;
+        border-radius: 2px;
+    }}
+
+    /* 3. Compact Squared Fader Cap with 1px razor center line */
+    QSlider::handle:horizontal {{
         background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-            stop: 0.00 {p['field']},
-            stop: 0.42 {p['field']},
-            stop: 0.44 {p['accent']},
-            stop: 0.56 {p['accent']},
-            stop: 0.58 {p['field']},
-            stop: 1.00 {p['field']}
-        );
-    }
-
-    QSlider::handle:horizontal:pressed {
-        border: 1px solid {p['accent_active']};
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-            stop: 0.00 {p['bg']},
-            stop: 0.42 {p['bg']},
-            stop: 0.44 {p['accent_active']},
-            stop: 0.56 {p['accent_active']},
-            stop: 0.58 {p['bg']},
-            stop: 1.00 {p['bg']}
-        );
-    }
-
-    /* ==================================================================== */
-    /* VERTICAL SLIDERS (ADSR Envelopes)                                   */
-    /* ==================================================================== */
-
-    QSlider::groove:vertical {
-        border: 1px solid {p['border']};
-        width: 6px;
-        background: {p['field']};
-        border-radius: 3px;
-    }
-
-    QSlider::handle:vertical {
-        /* Horizontal center line on vertical faders */
-        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-            stop: 0.00 {p['panel']},
-            stop: 0.43 {p['panel']},
-            stop: 0.45 {p['accent']},
-            stop: 0.55 {p['accent']},
-            stop: 0.57 {p['panel']},
-            stop: 1.00 {p['panel']}
+            stop: 0.00 {p.get('field', p['bg'])},
+            stop: 0.47 {p.get('field', p['bg'])},
+            stop: 0.48 {p['accent']},
+            stop: 0.52 {p['accent']},
+            stop: 0.53 {p.get('field', p['bg'])},
+            stop: 1.00 {p.get('field', p['bg'])}
         );
         border: 1px solid {p['border']};
         border-radius: 2px;
-        height: 18px;
-        width: 32px;                      /* Wide mixer fader cap */
-        margin-left: -13px;               /* Centers the 32px cap over 6px groove */
-        margin-right: -13px;
-    }
+        width: 14px;
+        margin-top: -6px;
+        margin-bottom: -6px;
+    }}
 
-    QSlider::handle:vertical:hover {
+    QSlider::handle:horizontal:hover {{
         border: 1px solid {p['accent']};
-    }
+    }}
 
-    QSlider::handle:vertical:pressed {
-        border: 1px solid {p['accent_active']};
-    }
+    QSlider::handle:horizontal:pressed {{
+        border: 1px solid {p.get('accent_active', p['accent'])};
+    }}
+
+    /* 4. Mixer Magnitude Tick Marks */
+    QSlider::tick-mark:horizontal {{
+        border: 1px solid {p['border']};
+        height: 4px;
+        width: 1px;
+    }}
+
+    /* ==================================================================== */
+    /* VERTICAL SLIDERS (ADSR Envelopes & Mixer)                           */
+    /* ==================================================================== */
+
+    /* UNCAP WIDGET WIDTH (Allows the 30px cap to render without clipping) */
+    QSlider:vertical {{
+        min-width: 44px;
+    }}
+
+    QSlider::groove:vertical {{
+        border: 1px solid {p['border']};
+        width: 4px;
+        background: {p.get('field', p['bg'])};
+        border-radius: 2px;
+    }}
+
+    QSlider::add-page:vertical {{
+        background: {p['accent']};
+        border: 1px solid {p['accent']};
+        width: 4px;
+        border-radius: 2px;
+    }}
+
+    QSlider::sub-page:vertical {{
+        background: {p.get('field', p['bg'])};
+        border: 1px solid {p['border']};
+        width: 4px;
+        border-radius: 2px;
+    }}
+
+    QSlider::handle:vertical {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop: 0.00 {p.get('field', p['bg'])},
+            stop: 0.46 {p.get('field', p['bg'])},
+            stop: 0.47 {p['accent']},
+            stop: 0.53 {p['accent']},
+            stop: 0.54 {p.get('field', p['bg'])},
+            stop: 1.00 {p.get('field', p['bg'])}
+        );
+        border: 1px solid {p['border']};
+        border-radius: 2px;
+        height: 16px;
+        width: 30px;
+        margin-left: -13px;               /* Centers 30px cap over 4px groove */
+        margin-right: -13px;
+    }}
+
+    QSlider::handle:vertical:hover {{
+        border: 1px solid {p['accent']};
+    }}
+
+    QSlider::handle:vertical:pressed {{
+        border: 1px solid {p.get('accent_active', p['accent'])};
+    }}
+
+
+    QSlider::tick-mark:vertical {{
+        border: 1px solid {p['border']};
+        width: 4px;
+        height: 1px;
+    }}
 
     /* Scrollbars */
     QScrollBar:vertical {{

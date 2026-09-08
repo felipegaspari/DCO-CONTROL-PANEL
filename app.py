@@ -9,7 +9,7 @@ import os
 import sys
 import threading
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -188,15 +189,98 @@ class Link:
 
 
 class BipolarSlider(QSlider):
-    """Horizontal slider that resets to center (or designated reset value) on double-click."""
+    """Console-style fader slider with double-click reset and persistent mixer ticks."""
 
     def __init__(self, orientation=Qt.Orientation.Horizontal, reset_val: int = 0, parent=None) -> None:
         super().__init__(orientation, parent)
         self.reset_val = reset_val
+        if orientation == Qt.Orientation.Vertical:
+            self.setMinimumWidth(44)
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.setValue(self.reset_val)
         event.accept()
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() in (
+            QEvent.Type.HoverEnter,
+            QEvent.Type.HoverLeave,
+            QEvent.Type.HoverMove,
+            QEvent.Type.Enter,
+            QEvent.Type.Leave,
+        ):
+            self.update()
+        return super().event(event)
+
+    def paintEvent(self, event) -> None:
+        # 1. Let Qt draw the background, groove, and cap first
+        super().paintEvent(event)
+
+        # 2. Draw mixer scale lines on top
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        w = self.width()
+        h = self.height()
+
+        pen_normal = QPen(QColor(160, 165, 175, 210), 1.0)
+        pen_center = QPen(QColor(220, 225, 235, 255), 1.5)
+
+        fractions = (0.0, 0.25, 0.50, 0.75, 1.0)
+
+        if self.orientation() == Qt.Orientation.Horizontal:
+            mid_y = h // 2
+            pad_x = 7
+            usable_w = w - 2 * pad_x
+            val_norm = (self.value() - self.minimum()) / max(1, self.maximum() - self.minimum())
+            handle_x = pad_x + val_norm * usable_w
+
+            # Cap boundaries (14px wide = 7px on each side)
+            cap_half_w = 7
+            inner_gap = 4  # Stops 2px away from 4px groove (never enters gap)
+
+            for frac in fractions:
+                x = int(pad_x + frac * usable_w)
+                is_center = (frac == 0.50)
+                painter.setPen(pen_center if is_center else pen_normal)
+
+                outer_len = 10 if is_center else 8
+                is_under_cap = abs(x - handle_x) <= cap_half_w
+
+                # When under the cap, draw only the tips sticking out above & below
+                top_start = (mid_y - 8) if is_under_cap else (mid_y - inner_gap)
+                bot_start = (mid_y + 8) if is_under_cap else (mid_y + inner_gap)
+
+                painter.drawLine(x, mid_y - outer_len, x, top_start)
+                painter.drawLine(x, bot_start, x, mid_y + outer_len)
+        else:
+            # Vertical Fader (Mixer Console Style)
+            mid_x = w // 2
+            pad_y = 8
+            usable_h = h - 2 * pad_y
+            val_norm = (self.value() - self.minimum()) / max(1, self.maximum() - self.minimum())
+            handle_y = h - pad_y - val_norm * usable_h
+
+            # Cap half-width (12px) and inner slot clearance (5px from center)
+            cap_half_w = 12
+            inner_gap = 5  # Keeps a 10px clear channel in center (never enters groove)
+
+            for frac in fractions:
+                y = int(h - pad_y - frac * usable_h)
+                is_center = (frac == 0.50)
+                painter.setPen(pen_center if is_center else pen_normal)
+
+                outer_w = 21 if is_center else 18
+                is_under_cap = abs(y - handle_y) <= 8
+
+                # When under the cap, draw only the wings sticking out on the sides
+                left_end = (mid_x - cap_half_w) if is_under_cap else (mid_x - inner_gap)
+                right_start = (mid_x + cap_half_w) if is_under_cap else (mid_x + inner_gap)
+
+                painter.drawLine(mid_x - outer_w, y, left_end, y)
+                painter.drawLine(right_start, y, mid_x + outer_w, y)
+
+        painter.end()
 
 class FilterResponsePreview(QWidget):
     """Vector frequency response curve (Bode plot) showing Cutoff, Resonance, and Mode."""
@@ -1795,7 +1879,6 @@ class App(QMainWindow):
         # Wire all cross-tab synced sliders
         self._wire_cross_panel_sync()
 
-
     # --- Oscillators Tab ---
 
     def _create_osc_slider_row(
@@ -1865,7 +1948,6 @@ class App(QMainWindow):
         h_lay.setContentsMargins(4, 4, 4, 4)
         h_lay.setSpacing(4)
 
-        # Explicit PID-to-glyph map prevents index-shifting bugs when waves are omitted
         wave_glyphs = {
             1: "◺ Saw", 2: "⎍ Pulse", 3: "⋀ Tri",
             87: "◺ Saw", 88: "⎍ Pulse", 89: "⋀ Tri",
@@ -1873,7 +1955,6 @@ class App(QMainWindow):
         }
 
         for pid in pids:
-            # OSC B (OSC2) has no Triangle wave on DCO4 (only available on DCO3)
             if pid == 89 and models.active().key != "dco3":
                 continue
 
@@ -1896,133 +1977,20 @@ class App(QMainWindow):
 
         parent_layout.addWidget(wave_box)
 
-# --- Oscillators Tab ---
-
     def _build_osc_tab(self, parent_layout: QVBoxLayout) -> None:
         self._wave_buttons: dict[int, QPushButton] = {}
 
-        # Master horizontal split: Left (Generators) vs Right (Engine & Dynamics)
+        # 3-Column Signal Flow: [Generators (4)] -> [Mixer (2)] -> [Engine & Modulation (5)]
         main_split = QHBoxLayout()
         main_split.setSpacing(12)
 
         # =====================================================================
-        # LEFT COLUMN: AUDIO GENERATORS (OSC 1, OSC 2, OSC 3, SUB)
+        # COLUMN 1: VOICE MODE, MASTER TUNING & OSCILLATOR GENERATORS
         # =====================================================================
-        left_col = QVBoxLayout()
-        left_col.setSpacing(8)
+        gen_col = QVBoxLayout()
+        gen_col.setSpacing(8)
 
-        # --- OSC 1 ---
-        osc1_box = QGroupBox(models.active().osc_row_names[0])
-        osc1_lay = QVBoxLayout(osc1_box)
-        osc1_lay.setSpacing(6)
-
-        if 13 in PARAM_BY_PID:
-            p13 = PARAM_BY_PID[13]
-            row_oct = QHBoxLayout()
-            row_oct.addWidget(QLabel("Octave:"))
-            cb13 = QComboBox()
-            for label, val in p13.choices:
-                cb13.addItem(label, val)
-            cb13.setCurrentIndex(
-                next((i for i, c in enumerate(p13.choices) if c[1] == p13.default), 0)
-            )
-            cb13.currentIndexChanged.connect(
-                lambda idx, pid=13, cb=cb13: self._on_combo_changed(pid, cb.itemData(idx))
-            )
-            row_oct.addWidget(cb13, 1)
-            osc1_lay.addLayout(row_oct)
-            self.param_widgets[13] = cb13
-
-        self._add_osc_wave_buttons(osc1_lay, (1, 2, 3))
-
-        if 22 in PARAM_BY_PID:
-            self._create_osc_slider_row(osc1_lay, 22, "Level", reset_val=127)
-
-        left_col.addWidget(osc1_box)
-
-        # --- OSC 2 ---
-        osc2_box = QGroupBox(models.active().osc_row_names[1])
-        osc2_lay = QVBoxLayout(osc2_box)
-        osc2_lay.setSpacing(6)
-
-        if 14 in PARAM_BY_PID:
-            self._create_osc_slider_row(osc2_lay, 14, "Interval", reset_val=36)
-        if 15 in PARAM_BY_PID:
-            self._create_osc_slider_row(osc2_lay, 15, "Detune", reset_val=256)
-
-        self._add_osc_wave_buttons(osc2_lay, (87, 88, 89))
-
-        if 23 in PARAM_BY_PID:
-            self._create_osc_slider_row(osc2_lay, 23, "Level", reset_val=0)
-
-        left_col.addWidget(osc2_box)
-
-        # --- OSC 3 (if model supports >= 3 oscillators) ---
-        has_osc3 = (
-            len(models.active().osc_row_names) >= 3
-            and 34 in PARAM_BY_PID
-            and not PARAM_BY_PID[34].hidden
-        )
-        if has_osc3:
-            osc3_box = QGroupBox(models.active().osc_row_names[2])
-            osc3_lay = QVBoxLayout(osc3_box)
-            osc3_lay.setSpacing(6)
-
-            if 34 in PARAM_BY_PID:
-                self._create_osc_slider_row(osc3_lay, 34, "Interval", reset_val=36)
-            if 35 in PARAM_BY_PID:
-                self._create_osc_slider_row(osc3_lay, 35, "Detune", reset_val=256)
-
-            self._add_osc_wave_buttons(osc3_lay, (90, 91, 92))
-
-            if 39 in PARAM_BY_PID:
-                self._create_osc_slider_row(osc3_lay, 39, "Level", reset_val=0)
-
-            left_col.addWidget(osc3_box)
-
-        # --- Sub-Oscillator (Compact box at the bottom of the left column) ---
-        sub_box = QGroupBox("Sub-Oscillator")
-        sub_lay = QVBoxLayout(sub_box)
-        sub_lay.setSpacing(6)
-
-        # Only display Sub Divide on DCO3
-        if models.active().key == "dco3" and 38 in PARAM_BY_PID and not PARAM_BY_PID[38].hidden:
-            p38 = PARAM_BY_PID[38]
-            row_sub = QHBoxLayout()
-            row_sub.addWidget(QLabel("Divide:"))
-            cb38 = QComboBox()
-            for label, val in p38.choices:
-                cb38.addItem(label, val)
-            cb38.setCurrentIndex(
-                next((i for i, c in enumerate(p38.choices) if c[1] == p38.default), 0)
-            )
-            cb38.currentIndexChanged.connect(
-                lambda idx, pid=38, cb=cb38: self._on_combo_changed(pid, cb.itemData(idx))
-            )
-            row_sub.addWidget(cb38, 1)
-            sub_lay.addLayout(row_sub)
-            self.param_widgets[38] = cb38
-
-        if 24 in PARAM_BY_PID:
-            self._create_osc_slider_row(sub_lay, 24, "Sub Level", reset_val=0)
-
-        left_col.addWidget(sub_box)
-        left_col.addStretch(1)
-
-        # Add left column to master layout with stretch factor 4
-        main_split.addLayout(left_col, 4)
-
-        # =====================================================================
-        # RIGHT COLUMN: ENGINE, MODULATION & DYNAMICS
-        # =====================================================================
-        right_col = QVBoxLayout()
-        right_col.setSpacing(10)
-
-        # --- Top Right Row: Voice Mode & Portamento ---
-        row_voice_porta = QHBoxLayout()
-        row_voice_porta.setSpacing(10)
-
-        # Voice Mode
+        # 1. Voice Mode
         voice_box = QGroupBox("Voice Mode")
         voice_lay = QVBoxLayout(voice_box)
         voice_lay.setSpacing(6)
@@ -2044,7 +2012,6 @@ class App(QMainWindow):
             voice_lay.addLayout(r26)
             self.param_widgets[26] = cb26
 
-        # Unison Detune right below Voice Mode
         if 28 in PARAM_BY_PID:
             self._create_osc_slider_row(voice_lay, 28, "Unison Detune", reset_val=0)
 
@@ -2065,10 +2032,151 @@ class App(QMainWindow):
             voice_lay.addLayout(r27)
             self.param_widgets[27] = cb27
 
-        voice_lay.addStretch(1)
-        row_voice_porta.addWidget(voice_box, 1)
+        gen_col.addWidget(voice_box)
 
-        # Portamento
+        # 2. Master Tuning
+        tune_box = QGroupBox("Master Tuning")
+        tune_lay = QVBoxLayout(tune_box)
+        tune_lay.setSpacing(6)
+
+        if 13 in PARAM_BY_PID:
+            p13 = PARAM_BY_PID[13]
+            row_oct = QHBoxLayout()
+            row_oct.addWidget(QLabel("Octave Shift:"))
+            cb13 = QComboBox()
+            for label, val in p13.choices:
+                cb13.addItem(label, val)
+            cb13.setCurrentIndex(
+                next((i for i, c in enumerate(p13.choices) if c[1] == p13.default), 0)
+            )
+            cb13.currentIndexChanged.connect(
+                lambda idx, pid=13, cb=cb13: self._on_combo_changed(pid, cb.itemData(idx))
+            )
+            row_oct.addWidget(cb13, 1)
+            tune_lay.addLayout(row_oct)
+            self.param_widgets[13] = cb13
+
+        if 133 in PARAM_BY_PID:
+            self._create_osc_slider_row(tune_lay, 133, "Master Detune", reset_val=256)
+
+        gen_col.addWidget(tune_box)
+
+        # 3. OSC 1
+        osc1_box = QGroupBox(models.active().osc_row_names[0])
+        osc1_lay = QVBoxLayout(osc1_box)
+        osc1_lay.setSpacing(6)
+
+        if 132 in PARAM_BY_PID:
+            self._create_osc_slider_row(osc1_lay, 132, "Detune", reset_val=256)
+
+        self._add_osc_wave_buttons(osc1_lay, (1, 2, 3))
+        gen_col.addWidget(osc1_box)
+
+        # 4. OSC 2
+        osc2_box = QGroupBox(models.active().osc_row_names[1])
+        osc2_lay = QVBoxLayout(osc2_box)
+        osc2_lay.setSpacing(6)
+
+        if 14 in PARAM_BY_PID:
+            self._create_osc_slider_row(osc2_lay, 14, "Interval", reset_val=36)
+        if 15 in PARAM_BY_PID:
+            self._create_osc_slider_row(osc2_lay, 15, "Detune", reset_val=256)
+
+        self._add_osc_wave_buttons(osc2_lay, (87, 88, 89))
+        gen_col.addWidget(osc2_box)
+
+        # 5. OSC 3 (if model >= 3)
+        has_osc3 = (
+            len(models.active().osc_row_names) >= 3
+            and 34 in PARAM_BY_PID
+            and not PARAM_BY_PID[34].hidden
+        )
+        if has_osc3:
+            osc3_box = QGroupBox(models.active().osc_row_names[2])
+            osc3_lay = QVBoxLayout(osc3_box)
+            osc3_lay.setSpacing(6)
+
+            if 34 in PARAM_BY_PID:
+                self._create_osc_slider_row(osc3_lay, 34, "Interval", reset_val=36)
+            if 35 in PARAM_BY_PID:
+                self._create_osc_slider_row(osc3_lay, 35, "Detune", reset_val=256)
+
+            self._add_osc_wave_buttons(osc3_lay, (90, 91, 92))
+            gen_col.addWidget(osc3_box)
+
+        gen_col.addStretch(1)
+        main_split.addLayout(gen_col, 4)
+
+        # =====================================================================
+        # COLUMN 2: VERTICAL AUDIO MIXER
+        # =====================================================================
+        mixer_box = QGroupBox("Oscillator Mixer")
+        mixer_lay = QVBoxLayout(mixer_box)
+        mixer_lay.setSpacing(8)
+
+        faders_lay = QHBoxLayout()
+        faders_lay.setContentsMargins(4, 8, 4, 8)
+        faders_lay.setSpacing(10)
+
+        mixer_channels = [(22, "OSC 1", 127), (23, "OSC 2", 0)]
+        if has_osc3 and 39 in PARAM_BY_PID:
+            mixer_channels.append((39, "OSC 3", 0))
+        if 24 in PARAM_BY_PID:
+            mixer_channels.append((24, "SUB", 0))
+
+        for pid, ch_name, def_val in mixer_channels:
+            p = PARAM_BY_PID[pid]
+            col = QVBoxLayout()
+            col.setSpacing(4)
+
+            lbl_ch = QLabel(ch_name)
+            lbl_ch.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_ch.setStyleSheet("font-weight: bold;")
+            col.addWidget(lbl_ch)
+
+            slider = BipolarSlider(Qt.Orientation.Vertical, reset_val=def_val)
+            slider.setRange(p.lo, p.hi)
+            slider.setValue(p.default)
+            slider.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+            rd = QLabel(str(p.default))
+            rd.setObjectName("ReadoutLabel")
+            rd.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            slider.valueChanged.connect(
+                lambda val, p_id=pid, r=rd: self._on_slider_changed(p_id, val, r)
+            )
+
+            col.addWidget(slider, 1, Qt.AlignmentFlag.AlignHCenter)
+            col.addWidget(rd, 0, Qt.AlignmentFlag.AlignCenter)
+
+            rst_btn = QPushButton("0")
+            rst_btn.setToolTip(f"Mute {ch_name} to 0")
+            rst_btn.setFixedWidth(28)
+            rst_btn.clicked.connect(lambda _, s=slider: s.setValue(0))
+            col.addWidget(rst_btn, 0, Qt.AlignmentFlag.AlignCenter)
+
+            faders_lay.addLayout(col)
+
+            self.param_widgets[pid] = slider
+            self._readouts[("p", pid)] = rd
+
+        mixer_lay.addLayout(faders_lay, 1)
+
+        zero_mix_btn = QPushButton("Mute All (Zero Levels)")
+        zero_mix_btn.setToolTip("Set all oscillator mix levels to 0")
+        zero_mix_btn.clicked.connect(self._zero_mixer_levels)
+        mixer_lay.addWidget(zero_mix_btn)
+
+        main_split.addWidget(mixer_box, 2)
+
+        # =====================================================================
+        # COLUMN 3: INDEPENDENT ROWS (PORTAMENTO, SYNC, DRIFT, DYNAMICS)
+        # =====================================================================
+        right_col = QVBoxLayout()
+        right_col.setSpacing(8)
+
+        # Row 1: Portamento
         porta_box = QGroupBox("Portamento")
         porta_lay = QVBoxLayout(porta_box)
         porta_lay.setSpacing(6)
@@ -2090,20 +2198,12 @@ class App(QMainWindow):
             porta_lay.addLayout(r33)
             self.param_widgets[33] = cb33
 
-        # Glide Time right below Glide Mode
         if 18 in PARAM_BY_PID:
             self._create_osc_slider_row(porta_lay, 18, "Glide Time", reset_val=0)
 
-        porta_lay.addStretch(1)
-        row_voice_porta.addWidget(porta_box, 1)
+        right_col.addWidget(porta_box)
 
-        right_col.addLayout(row_voice_porta)
-
-        # --- Middle Right Row: Sync/Crossmod & Analog Drift ---
-        row_sync_drift = QHBoxLayout()
-        row_sync_drift.setSpacing(10)
-
-        # Sync & Crossmod
+        # Row 2: Sync & Cross-Modulation
         sync_box = QGroupBox("Sync & Cross-Modulation")
         sync_lay = QVBoxLayout(sync_box)
         sync_lay.setSpacing(6)
@@ -2132,6 +2232,7 @@ class App(QMainWindow):
 
         if 130 in PARAM_BY_PID:
             self._create_osc_slider_row(sync_lay, 130, "Crossmod Depth", reset_val=0)
+
         if 131 in PARAM_BY_PID:
             p131 = PARAM_BY_PID[131]
             row_cm = QHBoxLayout()
@@ -2147,10 +2248,10 @@ class App(QMainWindow):
             row_cm.addWidget(selector131, 1)
             sync_lay.addLayout(row_cm)
             self.param_widgets[131] = selector131
-        sync_lay.addStretch(1)
-        row_sync_drift.addWidget(sync_box, 1)
 
-        # Analog Drift
+        right_col.addWidget(sync_box)
+
+        # Row 3: Analog Drift
         drift_box = QGroupBox("Analog Drift")
         drift_lay = QVBoxLayout(drift_box)
         drift_lay.setSpacing(6)
@@ -2162,54 +2263,38 @@ class App(QMainWindow):
         if 31 in PARAM_BY_PID:
             self._create_osc_slider_row(drift_lay, 31, "Stereo Spread", reset_val=1)
 
-        drift_lay.addStretch(1)
-        row_sync_drift.addWidget(drift_box, 1)
+        right_col.addWidget(drift_box)
 
-        right_col.addLayout(row_sync_drift)
-
-        # --- Bottom Right: Dynamics & Keytracking (Full width of right pane) ---
+        # Row 4: Dynamics & Keytracking
         dyn_box = QGroupBox("Dynamics & Keytracking")
-        dyn_lay = QHBoxLayout(dyn_box)
-        dyn_lay.setSpacing(16)
+        dyn_lay = QVBoxLayout(dyn_box)
+        dyn_lay.setSpacing(6)
 
-        # Column A: VCA Output & Velocity
-        vca_col = QVBoxLayout()
-        vca_col.setSpacing(6)
         if 43 in PARAM_BY_PID:
-            self._create_osc_slider_row(vca_col, 43, "VCA Output Level", reset_val=128)
+            self._create_osc_slider_row(dyn_lay, 43, "VCA Output Level", reset_val=128)
         if 21 in PARAM_BY_PID:
-            self._create_osc_slider_row(vca_col, 21, "Velocity → VCA", reset_val=0)
-
-        # Auto-detect VCA keytrack if defined
-        vca_kt_pid = next(
-            (p.pid for p in params.PARAMS if "vca" in p.label.lower() and "keytrack" in p.label.lower()),
-            None,
-        )
-        if vca_kt_pid and vca_kt_pid in PARAM_BY_PID:
-            self._create_osc_slider_row(vca_col, vca_kt_pid, "VCA Keytrack", reset_val=0)
-
-        vca_col.addStretch(1)
-        dyn_lay.addLayout(vca_col, 1)
-
-        # Column B: VCF Dynamics & Keytracking
-        vcf_col = QVBoxLayout()
-        vcf_col.setSpacing(6)
+            self._create_osc_slider_row(dyn_lay, 21, "Velocity → VCA", reset_val=0)
         if 20 in PARAM_BY_PID:
-            self._create_osc_slider_row(vcf_col, 20, "Velocity → VCF", reset_val=0)
+            self._create_osc_slider_row(dyn_lay, 20, "Velocity → VCF", reset_val=0)
         if 19 in PARAM_BY_PID:
-            self._create_osc_slider_row(vcf_col, 19, "VCF Keytrack", reset_val=0)
-
-        vcf_col.addStretch(1)
-        dyn_lay.addLayout(vcf_col, 1)
+            self._create_osc_slider_row(dyn_lay, 19, "VCF Keytrack", reset_val=0)
 
         right_col.addWidget(dyn_box)
         right_col.addStretch(1)
 
-        # Add right column to master layout with stretch factor 6
-        main_split.addLayout(right_col, 6)
+        main_split.addLayout(right_col, 5)
 
         parent_layout.addLayout(main_split)
         parent_layout.addStretch(1)
+
+    def _zero_mixer_levels(self) -> None:
+        """Sets all oscillator mixer levels to 0."""
+        for pid in (22, 23, 39, 24):
+            w = self.param_widgets.get(pid)
+            if isinstance(w, QSlider):
+                w.setValue(0)
+        self.log("[ui] Zeroed oscillator mixer levels\n")
+
 
     def _link_sliders(
         self, slider_a: QSlider, rd_a: QLabel, slider_b: QSlider, rd_b: QLabel, pid: int | None = None
@@ -2279,28 +2364,72 @@ class App(QMainWindow):
         if hasattr(self, "_vcf_vel_slider") and isinstance(primary_vel_vcf, QSlider) and rd_vel_vcf:
             self._link_sliders(self._vcf_vel_slider, self._vcf_vel_rd, primary_vel_vcf, rd_vel_vcf)
 
-# --- Envelopes Tab ---
+    # --- Envelopes Tab ---
+
+    def _create_env_slider_row(
+        self, parent_layout: QVBoxLayout, pid: int, label_text: str, reset_val: int = 0
+    ) -> QSlider:
+        """Compact horizontal slider row specifically sized for envelope columns."""
+        p = PARAM_BY_PID[pid]
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 1, 0, 1)
+        row.setSpacing(4)
+
+        lbl = QLabel(label_text)
+        lbl.setMinimumWidth(85)
+        row.addWidget(lbl)
+
+        slider = BipolarSlider(Qt.Orientation.Horizontal, reset_val=reset_val)
+        slider.setRange(p.lo, p.hi)
+        slider.setValue(p.default)
+        slider.setToolTip(f"Double-click to reset ({reset_val})")
+
+        rd = QLabel(param_meta.format_display_value(pid, p.default))
+        rd.setObjectName("ReadoutLabel")
+        rd.setFixedWidth(44)
+        rd.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        slider.valueChanged.connect(
+            lambda val, p_id=pid, r=rd: self._on_slider_changed(p_id, val, r)
+        )
+
+        row.addWidget(slider, 1)
+        row.addWidget(rd)
+
+        zero_btn = QPushButton("0")
+        zero_btn.setToolTip(f"Reset to {reset_val}")
+        zero_btn.setFixedWidth(24)
+        zero_btn.clicked.connect(lambda _, s=slider, d=reset_val: s.setValue(d))
+        row.addWidget(zero_btn)
+
+        parent_layout.addLayout(row)
+        self.param_widgets[p.pid] = slider
+        self._readouts[("p", p.pid)] = rd
+        return slider
 
     def _build_env_tab(self, parent_layout: QVBoxLayout) -> None:
         palette = theme.PALETTES.get(self.mode, theme.PALETTES[theme.DEFAULT_THEME])
         accent_col = QColor(palette["accent"])
 
         columns_layout = QHBoxLayout()
-        columns_layout.setSpacing(10)
+        columns_layout.setContentsMargins(0, 0, 0, 0)
+        columns_layout.setSpacing(8)
 
         self._env_previews: dict[str, EnvelopePreviewWidget] = {}
 
+        # Concise titles prevent the boxes from forcing wide dimensions
         env_specs = [
-            ("adsr_vca", "EnvVCA (ADSR 1) — Amplitude", 224, 48, 49, 50, 8),
-            ("adsr_vcf", "EnvVCF (ADSR 2) — Filter Timbre", 225, 51, 52, 53, 9),
-            ("adsr_dco", "EnvDCO (ADSR 3) — Pitch & PWM", 223, 54, 55, 56, 214),
+            ("adsr_vca", "EnvVCA (Amp)", 224, 48, 49, 50, 8),
+            ("adsr_vcf", "EnvVCF (Filter)", 225, 51, 52, 53, 9),
+            ("adsr_dco", "EnvDCO (Pitch/PWM)", 223, 54, 55, 56, 214),
         ]
 
         for bkey, title, mode_pid, a_pid, d_pid, rel_pid, r_pid in env_specs:
             block = self.blocks_by_key[bkey]
             box = QGroupBox(title)
             lay = QVBoxLayout(box)
-            lay.setSpacing(8)
+            lay.setContentsMargins(6, 8, 6, 8)
+            lay.setSpacing(6)
 
             # 1. Live Vector Preview
             prev = EnvelopePreviewWidget(accent_col)
@@ -2310,22 +2439,23 @@ class App(QMainWindow):
             # 2. ADSR Vertical Faders
             faders_box = QGroupBox("Stages (ADSR)")
             faders_lay = QHBoxLayout(faders_box)
-            faders_lay.setContentsMargins(4, 8, 4, 8)
-            faders_lay.setSpacing(6)
+            faders_lay.setContentsMargins(2, 6, 2, 6)
+            faders_lay.setSpacing(4)
             self.block_widgets[bkey] = {}
 
             for f in block.fields:
                 col = QVBoxLayout()
-                col.setSpacing(4)
+                col.setSpacing(2)
+
                 lbl = QLabel(f.label[0].upper())  # 'A', 'D', 'S', 'R'
                 lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 lbl.setStyleSheet("font-weight: bold;")
                 col.addWidget(lbl)
 
-                slider = QSlider(Qt.Orientation.Vertical)
+                slider = BipolarSlider(Qt.Orientation.Vertical, reset_val=f.default)
                 slider.setRange(f.lo, f.hi)
                 slider.setValue(f.default)
-                slider.setMinimumHeight(120)
+                slider.setMinimumHeight(110)
 
                 rd = QLabel(str(f.default))
                 rd.setObjectName("ReadoutLabel")
@@ -2337,7 +2467,7 @@ class App(QMainWindow):
                     )
                 )
 
-                col.addWidget(slider, 1, Qt.AlignmentFlag.AlignCenter)
+                col.addWidget(slider, 1, Qt.AlignmentFlag.AlignHCenter)
                 col.addWidget(rd, 0, Qt.AlignmentFlag.AlignCenter)
                 faders_lay.addLayout(col)
 
@@ -2346,16 +2476,22 @@ class App(QMainWindow):
 
             lay.addWidget(faders_box)
 
-            # 3. Shape & Response (Mode, Curves, Restart)
+            # 3. Shape & Response (Stacked compactly)
             shape_box = QGroupBox("Shape & Curves")
             shape_lay = QVBoxLayout(shape_box)
-            shape_lay.setSpacing(4)
+            shape_lay.setContentsMargins(4, 6, 4, 6)
+            shape_lay.setSpacing(3)
 
-            # Mode
+            # Mode Row
             if mode_pid in PARAM_BY_PID:
                 mp = PARAM_BY_PID[mode_pid]
                 m_row = QHBoxLayout()
-                m_row.addWidget(QLabel("Mode:"))
+                m_row.setContentsMargins(0, 0, 0, 0)
+                m_row.setSpacing(4)
+                lbl_m = QLabel("Mode:")
+                lbl_m.setFixedWidth(52)
+                m_row.addWidget(lbl_m)
+
                 mcb = QComboBox()
                 for label, val in mp.choices:
                     mcb.addItem(label, val)
@@ -2371,17 +2507,18 @@ class App(QMainWindow):
                 shape_lay.addLayout(m_row)
                 self.param_widgets[mp.pid] = mcb
 
-            # Curves Grid (Attack, Decay, Release)
-            grid_curves = QGridLayout()
-            grid_curves.setContentsMargins(0, 2, 0, 2)
-            grid_curves.setSpacing(4)
-
-            for idx_c, (pid, clbl) in enumerate(
-                ((a_pid, "Atk"), (d_pid, "Dec"), (rel_pid, "Rel"))
-            ):
+            # Curves stacked vertically (saves over 250px of horizontal width per column)
+            for pid, clbl in ((a_pid, "Attack:"), (d_pid, "Decay:"), (rel_pid, "Release:")):
                 if pid in PARAM_BY_PID:
                     cp = PARAM_BY_PID[pid]
-                    grid_curves.addWidget(QLabel(clbl), 0, idx_c)
+                    c_row = QHBoxLayout()
+                    c_row.setContentsMargins(0, 0, 0, 0)
+                    c_row.setSpacing(4)
+
+                    lbl_c = QLabel(clbl)
+                    lbl_c.setFixedWidth(52)
+                    c_row.addWidget(lbl_c)
+
                     cb = QComboBox()
                     for label, val in cp.choices:
                         cb.addItem(label, val)
@@ -2393,10 +2530,9 @@ class App(QMainWindow):
                             p, cbox.itemData(c_idx)
                         )
                     )
-                    grid_curves.addWidget(cb, 1, idx_c)
+                    c_row.addWidget(cb, 1)
+                    shape_lay.addLayout(c_row)
                     self.param_widgets[pid] = cb
-
-            shape_lay.addLayout(grid_curves)
 
             # Key Restart
             if r_pid in PARAM_BY_PID:
@@ -2411,32 +2547,36 @@ class App(QMainWindow):
 
             lay.addWidget(shape_box)
 
-            # 4. Target Modulations (Cross-Panel Synced)
+            # 4. Target Modulations (Compact Labels)
             mod_box = QGroupBox("Target Modulations")
             mod_lay = QVBoxLayout(mod_box)
-            mod_lay.setSpacing(4)
+            mod_lay.setContentsMargins(4, 6, 4, 6)
+            mod_lay.setSpacing(3)
 
             if bkey == "adsr_vca":
-                # Cross-linked to Oscillators Tab -> VCA level [PID 43]
                 self._env_vca_slider, self._env_vca_rd = self._create_mirrored_slider_row(
-                    mod_lay, "VCA Output Level", 0, 128, 128
+                    mod_lay, "VCA Level", 0, 128, 128
                 )
-                # Envelope to VCA depth
                 if 222 in PARAM_BY_PID:
-                    self._create_lfo_slider_row(mod_lay, 222, "Env to VCA Depth")
+                    self._create_env_slider_row(mod_lay, 222, "Env Depth", reset_val=512)
 
             elif bkey == "adsr_vcf":
-                # Cross-linked to Filter Tab -> adsr2_to_vcf
                 self._env_vcf_slider, self._env_vcf_rd = self._create_mirrored_slider_row(
-                    mod_lay, "VCF Cutoff Depth", 0, 512, 0
+                    mod_lay, "Cutoff Depth", 0, 512, 0
                 )
 
             elif bkey == "adsr_dco":
                 if 47 in PARAM_BY_PID:
-                    self._create_lfo_slider_row(mod_lay, 47, "Pitch Detune Depth")
+                    self._create_env_slider_row(mod_lay, 47, "Pitch Detune", reset_val=0)
+
                 if 10 in PARAM_BY_PID:
                     t_row = QHBoxLayout()
-                    t_row.addWidget(QLabel("Target:"))
+                    t_row.setContentsMargins(0, 0, 0, 0)
+                    t_row.setSpacing(4)
+                    lbl_t = QLabel("Target:")
+                    lbl_t.setFixedWidth(52)
+                    t_row.addWidget(lbl_t)
+
                     top_p = PARAM_BY_PID[10]
                     t_cb = QComboBox()
                     for label, val in top_p.choices:
@@ -2453,7 +2593,6 @@ class App(QMainWindow):
                     mod_lay.addLayout(t_row)
                     self.param_widgets[10] = t_cb
 
-                # Cross-linked to PWM Tab -> ADSR3 to PWM [PID 46]
                 self._env_pwm_slider, self._env_pwm_rd = self._create_mirrored_slider_row(
                     mod_lay, "PWM Depth", 0, 1023, 512, pid=46
                 )

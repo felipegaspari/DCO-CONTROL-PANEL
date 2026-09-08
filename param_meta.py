@@ -128,7 +128,7 @@ def scale_display_value(pid: int, val: int) -> int:
         return (val - 36) // 12
     if pid in (14, 34):  # PARAM_OSC2_INTERVAL, PARAM_OSC3_INTERVAL
         return val - 36
-    if pid in (15, 35):  # PARAM_OSC2_DETUNE_VAL, PARAM_OSC3_DETUNE_VAL
+    if pid in (15, 35, 132, 133):  # PARAM_OSC2_DETUNE_VAL, PARAM_OSC3_DETUNE_VAL
         return val - 256
     if pid == 46:  # PARAM_ADSR3_TO_PWM
         return val - 512
@@ -140,7 +140,7 @@ def format_display_value(pid: int, val: int) -> str:
         return f"{scaled:+d} oct"
     if pid in (14, 34):
         return f"{scaled:+d} st"
-    if pid in (15, 35):
+    if pid in (15, 35, 132, 133):
         return f"{scaled:+d}"
     if pid == 46:
         return f"{scaled:+d}"
